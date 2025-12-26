@@ -132,25 +132,18 @@ struct QwenVisionPreprocessor {
     guard let first = pixelArrays.first else { throw QwenVisionPreprocessorError.emptyInput }
     let height = first.dim(-2)
     let width = first.dim(-1)
+    let meanValues = (0..<3).map { Float32(config.imageMean[min($0, config.imageMean.count - 1)]) }
+    let stdValues = (0..<3).map { Float32(config.imageStd[min($0, config.imageStd.count - 1)]) }
+    let mean = MLXArray(meanValues, [3, 1, 1]).asType(.float32)
+    let std = MLXArray(stdValues, [3, 1, 1]).asType(.float32)
+    let rescale = MLXArray(Float32(config.rescaleFactor))
     let normalized = try pixelArrays.map { frame -> MLXArray in
       let floatFrame = frame.asType(.float32)
-      MLX.eval(floatFrame)
       let channelCount = floatFrame.dim(0)
       guard channelCount == 3 else {
         throw QwenVisionPreprocessorError.invalidChannelCount(expected: 3, got: channelCount)
       }
-      let spatial = floatFrame.dim(1) * floatFrame.dim(2)
-      var values = floatFrame.asArray(Float32.self)
-      for channel in 0..<channelCount {
-        let offset = channel * spatial
-        let mean = config.imageMean[min(channel, config.imageMean.count - 1)]
-        let std = config.imageStd[min(channel, config.imageStd.count - 1)]
-        for idx in 0..<spatial {
-          let value = values[offset + idx]
-          values[offset + idx] = (value * config.rescaleFactor - mean) / std
-        }
-      }
-      return MLXArray(values, floatFrame.shape)
+      return (floatFrame * rescale - mean) / std
     }
     return try preprocess(pixelArrays: normalized, resizedHeight: height, resizedWidth: width)
   }

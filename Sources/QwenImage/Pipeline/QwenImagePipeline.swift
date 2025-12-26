@@ -177,17 +177,12 @@ public final class QwenImagePipeline {
   private var baseWeightsDirectory: URL?
 
   private var tokenizer: QwenTokenizer?
-  private var tokenizerSnapshot: HubSnapshot?
   private var textEncoder: QwenTextEncoder?
-  private var textEncoderSnapshot: HubSnapshot?
   private var visionTokensPerSecond: Int = 2
   private var transformer: QwenTransformer?
-  private var transformerSnapshot: HubSnapshot?
   private var transformerDirectory: URL?
   private var unet: QwenUNet?
-  private var unetSnapshot: HubSnapshot?
   private var vae: QwenVAE?
-  private var vaeSnapshot: HubSnapshot?
   private let visionPreprocessor = QwenVisionPreprocessor()
   private var visionTower: QwenVisionTower?
   private let visionConfiguration = QwenVisionConfiguration()
@@ -283,7 +278,6 @@ public final class QwenImagePipeline {
 
   public func prepareTokenizer(from directory: URL, maxLength: Int? = nil) throws {
     let tokenizer = try QwenTokenizer.load(from: directory, maxLengthOverride: maxLength)
-    tokenizerSnapshot = nil
     self.tokenizer = tokenizer
   }
 
@@ -354,7 +348,6 @@ public final class QwenImagePipeline {
       dtype: dtype,
       quantization: quantPlan
     )
-    transformerSnapshot = nil
     transformerDirectory = directory
     self.transformer = transformer
     visionTower = nil
@@ -784,12 +777,11 @@ public final class QwenImagePipeline {
         let extra = drop - configuredDrop
         var keepLengths: [Int] = []
         keepLengths.reserveCapacity(promptEmbeddings.dim(0))
+        let lengthArray = MLX.sum(encoderMask.asType(.int32), axis: 1).asType(.int32)
+        MLX.eval(lengthArray)
+        let lengths = lengthArray.asArray(Int32.self)
         for row in 0..<promptEmbeddings.dim(0) {
-          let maskRow = encoderMask[row, 0...]
-          let lengthArray = MLX.sum(maskRow.asType(.int32))
-          MLX.eval(lengthArray)
-          let rowLength = lengthArray.item(Int.self)
-          keepLengths.append(max(0, rowLength - extra))
+          keepLengths.append(max(0, Int(lengths[row]) - extra))
         }
         let maxKeep = keepLengths.max() ?? 0
         if maxKeep >= 0 {
@@ -959,6 +951,7 @@ public final class QwenImagePipeline {
     let embeddings = stacked.embeddings.asType(preferredWeightDType() ?? stacked.embeddings.dtype)
     let attentionMask = stacked.attentionMask.asType(.int32)
 
+    MLX.eval(embeddings, attentionMask)
     offloadEncoderComponents()
 
     try ensureUNetAndVAE(model: model)
@@ -1047,6 +1040,12 @@ public final class QwenImagePipeline {
     let referenceTokens = referenceContext.referenceTokens.asType(finalReferenceDType)
     pipelineLogger.debug("edit: reference tokens shape=\(referenceTokens.shape) segments=\(referenceContext.imageSegments)")
 
+    MLX.eval(
+      guidanceEncoding.unconditionalEmbeddings,
+      guidanceEncoding.conditionalEmbeddings,
+      guidanceEncoding.unconditionalMask,
+      guidanceEncoding.conditionalMask
+    )
     offloadEncoderComponents()
 
     try ensureUNetAndVAE(model: model)
@@ -1136,6 +1135,12 @@ public final class QwenImagePipeline {
     let finalReferenceDType = preferredWeightDType() ?? guidanceEncoding.unconditionalEmbeddings.dtype
     let referenceTokens = referenceContext.referenceTokens.asType(finalReferenceDType)
     pipelineLogger.debug("edit: reference tokens shape=\(referenceTokens.shape) segments=\(referenceContext.imageSegments)")
+    MLX.eval(
+      guidanceEncoding.unconditionalEmbeddings,
+      guidanceEncoding.conditionalEmbeddings,
+      guidanceEncoding.unconditionalMask,
+      guidanceEncoding.conditionalMask
+    )
     offloadEncoderComponents()
     try ensureUNetAndVAE(model: model)
 
@@ -1582,7 +1587,6 @@ public final class QwenImagePipeline {
   /// resident set. This primarily targets the text encoder and vision tower.
   private func offloadEncoderComponents() {
     textEncoder = nil
-    textEncoderSnapshot = nil
     textEncoderQuantization = nil
     textEncoderRuntimeQuantized = false
     visionTower = nil
@@ -1624,7 +1628,6 @@ public final class QwenImagePipeline {
       self?.publish(progress: progress)
     }
     let tokenizer = try QwenTokenizer.load(from: directory)
-    tokenizerSnapshot = snapshot
     self.tokenizer = tokenizer
   }
 
@@ -1646,7 +1649,6 @@ public final class QwenImagePipeline {
       dtype: preferredWeightDType(),
       quantization: quantPlan
     )
-    textEncoderSnapshot = snapshot
     textEncoder = encoder
     applyRuntimeQuantizationIfNeeded(to: encoder, flag: &textEncoderRuntimeQuantized)
   }
@@ -1673,7 +1675,6 @@ public final class QwenImagePipeline {
       dtype: dtype,
       quantization: quantPlan
     )
-    transformerSnapshot = snapshot
     transformerDirectory = directory
     self.transformer = transformer
     visionTower = nil
@@ -1703,7 +1704,6 @@ public final class QwenImagePipeline {
       dtype: dtype,
       quantization: quantPlan
     )
-    unetSnapshot = snapshot
     self.unet = unet
     transformerDirectory = directory
     visionTower = nil
@@ -1717,7 +1717,6 @@ public final class QwenImagePipeline {
     try await weightsLoader.loadVAE(from: snapshot, into: vae, dtype: dtype) { [weak self] progress in
       self?.publish(progress: progress)
     }
-    vaeSnapshot = snapshot
     self.vae = vae
   }
 
@@ -1972,9 +1971,7 @@ public final class QwenImagePipeline {
         dtype: dtype
       )
     }
-    let sigmaScalar = sigmas[0]
-    MLX.eval(sigmaScalar)
-    let sigmaValue = sigmaScalar.asType(dtype)
+    let sigmaValue = sigmas[0].asType(dtype)
     return latents * sigmaValue
   }
 

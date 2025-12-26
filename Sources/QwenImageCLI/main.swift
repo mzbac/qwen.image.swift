@@ -872,16 +872,34 @@ struct QwenImageCLIEntry {
     }
 
     // Save output images
+    // Detect if outputPath is a directory (ends with / or is existing directory)
     let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
-    let outputDir = outputURL.deletingLastPathComponent()
-    try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+    let isDirectory = outputPath.hasSuffix("/") || {
+      var isDir: ObjCBool = false
+      return FileManager.default.fileExists(atPath: outputPath, isDirectory: &isDir) && isDir.boolValue
+    }()
 
-    let baseName = outputURL.deletingPathExtension().lastPathComponent
-    let ext = outputURL.pathExtension.isEmpty ? "png" : outputURL.pathExtension
+    let outputDir: URL
+    let baseName: String
+    let ext: String
+
+    if isDirectory {
+      // outputPath is a directory: save as {dir}/layer_1.png, layer_2.png, ...
+      outputDir = outputURL
+      baseName = "layer"
+      ext = "png"
+    } else {
+      // outputPath is a file: save as {baseName}_layer_1.{ext}, {baseName}_layer_2.{ext}, ...
+      outputDir = outputURL.deletingLastPathComponent()
+      baseName = outputURL.deletingPathExtension().lastPathComponent
+      ext = outputURL.pathExtension.isEmpty ? "png" : outputURL.pathExtension
+    }
+
+    try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
     for (i, layerArray) in layerImages.enumerated() {
       let layerIndex = i + 1
-      let layerFileName = "\(baseName)_layer_\(layerIndex).\(ext)"
+      let layerFileName = isDirectory ? "\(baseName)_\(layerIndex).\(ext)" : "\(baseName)_layer_\(layerIndex).\(ext)"
       let layerURL = outputDir.appendingPathComponent(layerFileName)
 
       let image = try mlxArrayToImage(layerArray)

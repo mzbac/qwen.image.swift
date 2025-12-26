@@ -75,7 +75,7 @@ final class QwenVisionTower: Module {
     var outputs: [MLXArray] = []
     var cuWindowLengths: [Int] = [0]
     var cuFullLengths: [Int] = [0]
-    var windowIndicesAll: [Int] = []
+    var windowIndicesAll: [Int32] = []
     var rotaryCosSlices: [MLXArray] = []
     var rotarySinSlices: [MLXArray] = []
 
@@ -113,6 +113,7 @@ final class QwenVisionTower: Module {
       )
       let windowIndex = windowData.index
       let cuWindowSeqLens = windowData.cuWindowSeqLens
+      let windowIndexValues = windowData.indexValues
 
       // Reorder hidden states and rotary embeddings by window index (group of 4 tokens per LLM cell)
       var hidden = sampleTokens
@@ -159,7 +160,7 @@ final class QwenVisionTower: Module {
       let merged = patchMerger(hidden)
 
       // Reverse window index to original LLM order
-      let reverseIdx = argsortInt32(windowIndex)
+      let reverseIdx = argsortInt32(windowIndexValues)
       let restored = MLX.take(merged, reverseIdx, axis: 0)
 
       outputs.append(restored)
@@ -176,13 +177,8 @@ final class QwenVisionTower: Module {
       for _ in 0..<entry.temporal { cumulativeFull += perFrame; cuFullLengths.append(cumulativeFull) }
 
       // Aggregate window index (shifted by base across samples) for output/debug
-      do {
-        let shifted = MLX.add(windowIndex.asType(.int32), MLXArray([Int32(llmCellBase)].map(Float32.init), [1]).asType(.int32))
-        let flat = shifted.asType(.int32)
-        MLX.eval(flat)
-        let vals = flat.asArray(Int32.self)
-        windowIndicesAll.append(contentsOf: vals.map { Int($0) })
-      }
+      let base = Int32(llmCellBase)
+      windowIndicesAll.append(contentsOf: windowIndexValues.map { $0 + base })
 
       llmCellBase += mergedPerFrame * entry.temporal
     }
@@ -211,19 +207,18 @@ final class QwenVisionTower: Module {
     dtype: DType
   ) -> MLXArray {
     let lensArr = cuSeqlens.asType(.int32)
-    MLX.eval(lensArr)
-    let lens = lensArr.asArray(Int32.self).map { Int($0) }
-    guard lens.count >= 2 else {
+    let count = lensArr.dim(0)
+    guard count >= 2 else {
       return MLX.zeros([1, sequenceLength, sequenceLength], dtype: .bool)
     }
-    let chunkCount = lens.count - 1
+    let chunkCount = count - 1
     guard chunkCount > 0 else {
       return MLX.zeros([1, sequenceLength, sequenceLength], dtype: .bool)
     }
-    let startValues = Array(lens.dropLast()).map(Int32.init)
-    let endValues = Array(lens.dropFirst()).map(Int32.init)
-    let starts = MLXArray(startValues.map(Float32.init), [chunkCount]).asType(.int32).reshaped(1, chunkCount)
-    let ends = MLXArray(endValues.map(Float32.init), [chunkCount]).asType(.int32).reshaped(1, chunkCount)
+    let startValues = lensArr[0..<chunkCount]
+    let endValues = lensArr[1..<count]
+    let starts = startValues.reshaped(1, chunkCount)
+    let ends = endValues.reshaped(1, chunkCount)
     let tokenPositions = MLXArray(0..<sequenceLength).asType(.int32).reshaped(sequenceLength, 1)
     let geStart = MLX.greaterEqual(tokenPositions, starts)
     let ltEnd = MLX.less(tokenPositions, ends)
@@ -239,7 +234,7 @@ final class QwenVisionTower: Module {
     temporal: Int,
     height: Int,
     width: Int
-  ) -> (index: MLXArray, cuWindowSeqLens: MLXArray) {
+  ) -> (index: MLXArray, cuWindowSeqLens: MLXArray, indexValues: [Int32]) {
     let llmH = height / configuration.spatialMergeSize
     let llmW = width / configuration.spatialMergeSize
     let vitWindow = configuration.windowSize / configuration.spatialMergeSize / configuration.patchSize
@@ -298,15 +293,12 @@ final class QwenVisionTower: Module {
 
     let indexArr = MLXArray(windowIndexAll.map(Float32.init), [windowIndexAll.count]).asType(.int32)
     let cuArr = MLXArray(cuLens.map(Float32.init), [cuLens.count]).asType(.int32)
-    return (indexArr, cuArr)
+    return (indexArr, cuArr, windowIndexAll)
   }
 
   // Argsort for int32 array (CPU path) → MLXArray[int32]
-  private func argsortInt32(_ values: MLXArray) -> MLXArray {
-    let ints = values.asType(.int32)
-    MLX.eval(ints)
-    let swiftVals = ints.asArray(Int32.self)
-    let indexed = swiftVals.enumerated().map { ($0.offset, $0.element) }
+  private func argsortInt32(_ values: [Int32]) -> MLXArray {
+    let indexed = values.enumerated().map { ($0.offset, $0.element) }
     let sorted = indexed.sorted { $0.1 < $1.1 }
     let result: [Int32] = sorted.map { Int32($0.0) }
     return MLXArray(result.map(Float32.init), [result.count]).asType(.int32)
@@ -363,6 +355,11 @@ final class QwenVisionTower: Module {
   }
 
   private func makeIndexArray(_ values: [Int]) -> MLXArray {
+    let floats = values.map(Float32.init)
+    return MLXArray(floats, [values.count]).asType(.int32)
+  }
+
+  private func makeIndexArray(_ values: [Int32]) -> MLXArray {
     let floats = values.map(Float32.init)
     return MLXArray(floats, [values.count]).asType(.int32)
   }

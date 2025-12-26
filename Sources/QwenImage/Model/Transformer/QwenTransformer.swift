@@ -162,10 +162,9 @@ public final class QwenTransformer: Module {
     timeTextEmbed: QwenTimeTextEmbed,
     runtimeConfig: QwenRuntimeConfig
   ) -> MLXArray {
-    let sigma = runtimeConfig.scheduler.sigmas[timestepIndex].item(Float.self)
     let batch = hiddenStates.dim(0)
-    let values = Array(repeating: sigma, count: batch)
-    let timesteps = MLXArray(values, [batch]).asType(.float32)
+    let sigma = runtimeConfig.scheduler.sigmas[timestepIndex].asType(.float32)
+    let timesteps = MLX.broadcast(sigma, to: [batch])
     return timeTextEmbed(timestep: timesteps, hiddenStates: hiddenStates)
   }
 

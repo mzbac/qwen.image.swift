@@ -108,14 +108,10 @@ public final class QwenTextEncoder: Module {
     }
 
     let trimmedStart = max(0, min(dropIndex, seqLen))
-    let validLengthsArray = mask.sum(axis: 1)
-    var trimmedLengths: [Int] = []
-    trimmedLengths.reserveCapacity(batchSize)
-
-    for batch in 0..<batchSize {
-      let validLength = validLengthsArray[batch].item(Int.self)
-      trimmedLengths.append(max(0, validLength - trimmedStart))
-    }
+    let validLengthsArray = mask.sum(axis: 1).asType(.int32)
+    MLX.eval(validLengthsArray)
+    let validLengths = validLengthsArray.asArray(Int32.self)
+    let trimmedLengths = validLengths.map { max(0, Int($0) - trimmedStart) }
 
     let maxTrimmedLength = trimmedLengths.max() ?? 0
 
@@ -714,40 +710,31 @@ extension QwenTextEncoder {
     if replacementTensor.dtype != .float32 {
       replacementTensor = replacementTensor.asType(.float32)
     }
-    MLX.eval(replacementTensor)
-    let replacementValues = replacementTensor.asArray(Float32.self)
     let replacementCount = replacementTensor.dim(0)
 
-    var tokenArray = inputIds.asType(.int32)
-    MLX.eval(tokenArray)
-    let tokenValues = tokenArray.asArray(Int32.self)
-
-    var updatedRows: [MLXArray] = []
-    updatedRows.reserveCapacity(batch)
-    for row in 0..<batch {
-      var rowEmb = hiddenStates[row, 0..., 0...].asType(.float32)
-      MLX.eval(rowEmb)
-      var rowValues = rowEmb.asArray(Float32.self)
-      var cursor = 0
-      for position in 0..<seqLen where tokenValues[row * seqLen + position] == Int32(imageTokenId) {
-        precondition(cursor < replacementCount, "[QwenTextEncoder] placeholder mismatch in row \(row)")
-        let dest = position * hiddenDim
-        let src = cursor * hiddenDim
-        rowValues.withUnsafeMutableBufferPointer { destPtr in
-          replacementValues.withUnsafeBufferPointer { srcPtr in
-            guard let destBase = destPtr.baseAddress, let srcBase = srcPtr.baseAddress else {
-              preconditionFailure("Buffer pointers must not be empty")
-            }
-            memcpy(destBase + dest, srcBase + src, hiddenDim * MemoryLayout<Float32>.size)
-          }
-        }
-        cursor += 1
-      }
-      precondition(cursor == replacementCount, "[QwenTextEncoder] row \(row) consumed \(cursor) tokens, expected \(replacementCount)")
-      let rowArray = MLXArray(rowValues, [seqLen, hiddenDim]).asType(hiddenStates.dtype)
-      updatedRows.append(rowArray)
+    let tokenMask = inputIds .== Int32(imageTokenId)
+    let tokenMaskInt = tokenMask.asType(.int32)
+    let counts = MLX.sum(tokenMaskInt, axis: 1).asType(.int32)
+    MLX.eval(counts)
+    let countValues = counts.asArray(Int32.self)
+    for (row, count) in countValues.enumerated() {
+      precondition(count == Int32(replacementCount), "[QwenTextEncoder] placeholder mismatch in row \(row)")
     }
-    return MLX.stacked(updatedRows, axis: 0)
+
+    if replacementCount == 0 {
+      return hiddenStates
+    }
+
+    let positions = tokenMaskInt.cumsum(axis: 1)
+    let one = MLXArray(Int32(1))
+    let zero = MLXArray(Int32(0))
+    let replacementIndices = positions - one
+    let safeIndices = MLX.maximum(replacementIndices, zero)
+    let flatIndices = safeIndices.reshaped([-1])
+    let gathered = MLX.take(replacementTensor, flatIndices, axis: 0)
+    let gatheredReshaped = gathered.reshaped(batch, seqLen, hiddenDim).asType(hiddenStates.dtype)
+    let maskExpanded = MLX.broadcast(tokenMask.reshaped(batch, seqLen, 1), to: [batch, seqLen, hiddenDim])
+    return MLX.where(maskExpanded, gatheredReshaped, hiddenStates)
   }
 
   private func buildPositionIds(
@@ -760,10 +747,9 @@ extension QwenTextEncoder {
     let batch = inputIds.dim(0)
     let seqLen = inputIds.dim(1)
     var ids = inputIds.asType(.int32)
-    MLX.eval(ids)
-    let idValues = ids.asArray(Int32.self)
     var mask = attentionMask.asType(.int32)
-    MLX.eval(mask)
+    MLX.eval(ids, mask)
+    let idValues = ids.asArray(Int32.self)
     let maskValues = mask.asArray(Int32.self)
 
     var posT = [Int32](repeating: 0, count: batch * seqLen)

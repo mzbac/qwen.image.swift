@@ -425,6 +425,13 @@ public class QwenLayeredPipeline {
       negativeTxtSeqLens = [Int](repeating: negEncoded.embeddings.dim(1), count: batchSize)
     }
 
+    if let negEmbeds = negativePromptEmbeds, let negMask = negativePromptMask {
+      MLX.eval(promptEmbeds, promptMask, negEmbeds, negMask)
+    } else {
+      MLX.eval(promptEmbeds, promptMask)
+    }
+    textEncoder = nil
+
     logger.info("Starting denoising with \(parameters.numInferenceSteps) steps")
 
     for i in 0..<parameters.numInferenceSteps {
