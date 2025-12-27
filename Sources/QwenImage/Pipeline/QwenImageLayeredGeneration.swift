@@ -441,6 +441,7 @@ public class QwenLayeredPipeline {
     }
 
     logger.info("Starting denoising with \(parameters.numInferenceSteps) steps")
+    progress?(0, parameters.numInferenceSteps, 0)
 
     for i in 0..<parameters.numInferenceSteps {
       let latentInput = MLX.concatenated([latents, packedImageLatent], axis: 1)
@@ -490,7 +491,7 @@ public class QwenLayeredPipeline {
       }
 
       let progressFraction = Float(i + 1) / Float(parameters.numInferenceSteps)
-      progress?(i, parameters.numInferenceSteps, progressFraction)
+      progress?(i + 1, parameters.numInferenceSteps, progressFraction)
     }
 
     logger.info("Decoding layers")
@@ -624,6 +625,7 @@ public class QwenLayeredPipeline {
     }
 
     logger.info("Starting denoising with \(parameters.numInferenceSteps) steps")
+    progress?(0, parameters.numInferenceSteps, 0)
 
     for i in 0..<parameters.numInferenceSteps {
       let latentInput = MLX.concatenated([latents, packedImageLatent], axis: 1)
@@ -673,7 +675,7 @@ public class QwenLayeredPipeline {
       }
 
       let progressFraction = Float(i + 1) / Float(parameters.numInferenceSteps)
-      progress?(i, parameters.numInferenceSteps, progressFraction)
+      progress?(i + 1, parameters.numInferenceSteps, progressFraction)
     }
 
     logger.info("Decoding layers")
