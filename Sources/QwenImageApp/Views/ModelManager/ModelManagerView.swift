@@ -27,6 +27,10 @@ struct ModelManagerView: View {
         }
         .padding(.horizontal, 40)
 
+        // Lightning LoRA Card
+        LightningLoRACard(viewModel: viewModel)
+          .padding(.horizontal, 40)
+
         // Info Section
         VStack(alignment: .leading, spacing: 12) {
           Label("About Models", systemImage: "info.circle")
@@ -135,7 +139,7 @@ struct ModelCard: View {
               await viewModel.downloadModel(model, variant: appState.selectedVariant(for: model))
             }
           } label: {
-            Label("Download (\(model.size(for: appState.selectedVariant(for: model))))", systemImage: "arrow.down.circle")
+            Label("Download", systemImage: "arrow.down.circle")
               .frame(maxWidth: .infinity)
           }
           .buttonStyle(.borderedProminent)
@@ -229,7 +233,7 @@ struct ModelCard: View {
                       .controlSize(.small)
                     }
                   } else {
-                    Button("Download (\(model.size(for: variant)))") {
+                    Button("Download") {
                       Task {
                         await viewModel.downloadModel(model, variant: variant)
                       }
@@ -309,6 +313,219 @@ struct ModelCard: View {
   }
 }
 
+// MARK: - Lightning LoRA Card
+
+@MainActor
+struct LightningLoRACard: View {
+  @Environment(AppState.self) private var appState
+  @Bindable var viewModel: ModelManagerViewModel
+  
+  private var isInstalled: Bool {
+    kDefaultLightningLoRAPath != nil
+  }
+  
+  private var loraSize: String? {
+    guard let path = kDefaultLightningLoRAPath else { return nil }
+    return viewModel.formattedSize(for: path)
+  }
+  
+  var body: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      // Header
+      HStack {
+        VStack(alignment: .leading, spacing: 4) {
+          Text("Lightning LoRA")
+            .font(.title2.bold())
+          Text("Speed up generation to just 4 steps with reduced quality")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+        }
+        
+        Spacer()
+        
+        // Status Badge
+        statusBadge
+      }
+      
+      // Content based on status
+      switch appState.lightningLoRAStatus {
+      case .notDownloaded:
+        if isInstalled {
+          installedContent
+        } else {
+          notInstalledContent
+        }
+      case .downloading(let progress, let description):
+        downloadingContent(progress: progress, description: description)
+      case .downloaded:
+        installedContent
+      case .error(let message):
+        errorContent(message: message)
+      }
+    }
+    .padding(20)
+    .frame(maxWidth: 600)
+    .background(
+      RoundedRectangle(cornerRadius: 16)
+        .fill(Color(nsColor: .controlBackgroundColor))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 16)
+        .strokeBorder(borderColor.opacity(0.3), lineWidth: 1)
+    )
+    .onAppear {
+      // Check if already installed on appear
+      if isInstalled && appState.lightningLoRAStatus == .notDownloaded {
+        appState.lightningLoRAStatus = .downloaded
+      }
+    }
+  }
+  
+  private var borderColor: Color {
+    switch appState.lightningLoRAStatus {
+    case .notDownloaded:
+      return isInstalled ? .green : .orange
+    case .downloading:
+      return .blue
+    case .downloaded:
+      return .green
+    case .error:
+      return .red
+    }
+  }
+  
+  @ViewBuilder
+  private var statusBadge: some View {
+    let (color, text): (Color, String) = {
+      switch appState.lightningLoRAStatus {
+      case .notDownloaded:
+        return isInstalled ? (.green, "Installed") : (.secondary, "Not Installed")
+      case .downloading:
+        return (.blue, "Downloading")
+      case .downloaded:
+        return (.green, "Installed")
+      case .error:
+        return (.red, "Error")
+      }
+    }()
+    
+    HStack(spacing: 4) {
+      if case .downloading = appState.lightningLoRAStatus {
+        ProgressView()
+          .scaleEffect(0.6)
+      } else {
+        Circle()
+          .fill(color)
+          .frame(width: 8, height: 8)
+      }
+      Text(text)
+        .font(.caption)
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 5)
+    .background(
+      Capsule()
+        .fill(color.opacity(0.1))
+    )
+  }
+  
+  @ViewBuilder
+  private var installedContent: some View {
+    HStack {
+      Image(systemName: "checkmark.circle.fill")
+        .foregroundStyle(.green)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Ready to use")
+          .foregroundStyle(.green)
+        if let size = loraSize {
+          Text(size)
+            .font(.caption2)
+            .foregroundStyle(.green)
+        }
+      }
+      Spacer()
+      Button("Show in Finder") {
+        if let path = kDefaultLightningLoRAPath {
+          NSWorkspace.shared.activateFileViewerSelecting([path])
+        }
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
+    }
+  }
+  
+  @ViewBuilder
+  private var notInstalledContent: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Image(systemName: "bolt.fill")
+          .foregroundStyle(.orange)
+        Text("Optional: Download for faster generation")
+          .font(.callout)
+      }
+      
+      Text("The Lightning LoRA enables 4-step generation (instead of 20+ steps) for faster results with slightly reduced quality.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      
+      Button {
+        Task {
+          await viewModel.downloadLightningLoRA()
+        }
+      } label: {
+        Label("Download Lightning LoRA", systemImage: "arrow.down.circle")
+          .frame(maxWidth: .infinity)
+      }
+      .buttonStyle(.borderedProminent)
+      .controlSize(.regular)
+    }
+  }
+  
+  @ViewBuilder
+  private func downloadingContent(progress: Double, description: String) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      ProgressView(value: progress)
+        .progressViewStyle(.linear)
+      
+      HStack {
+        Text(description)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer()
+        Text(String(format: "%.1f%%", progress * 100))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .monospacedDigit()
+      }
+      
+      Button("Cancel") {
+        viewModel.cancelLightningLoRADownload()
+      }
+      .buttonStyle(.bordered)
+    }
+  }
+  
+  @ViewBuilder
+  private func errorContent(message: String) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundStyle(.red)
+        Text(message)
+          .font(.callout)
+          .foregroundStyle(.red)
+      }
+      
+      Button("Retry Download") {
+        Task {
+          await viewModel.downloadLightningLoRA()
+        }
+      }
+      .buttonStyle(.borderedProminent)
+    }
+  }
+}
+
 struct StatusBadge: View {
   let status: ModelStatus
 
@@ -357,14 +574,56 @@ final class ModelManagerViewModel {
   private var downloadTasks: [String: Task<Void, Never>] = [:]
   private var downloadProgresses: [String: HubSnapshotProgress] = [:]
 
-  /// Get the actual formatted size of a downloaded model
+  /// Get the actual formatted size of a downloaded model (recursively calculates directory size)
   func formattedSize(for path: URL) -> String {
     let fm = FileManager.default
-    guard let attrs = try? fm.attributesOfItem(atPath: path.path),
-          let size = attrs[.size] as? Int64 else {
+    var isDirectory: ObjCBool = false
+    guard fm.fileExists(atPath: path.path, isDirectory: &isDirectory) else {
       return "Unknown"
     }
-    return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+    
+    let totalSize: Int64
+    if isDirectory.boolValue {
+      // Recursively calculate the total size of all files in the directory
+      totalSize = calculateDirectorySize(at: path, fileManager: fm)
+    } else {
+      // Single file
+      if let attrs = try? fm.attributesOfItem(atPath: path.path),
+         let size = attrs[.size] as? Int64 {
+        totalSize = size
+      } else {
+        return "Unknown"
+      }
+    }
+    
+    return ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)
+  }
+  
+  /// Recursively calculate the total size of a directory
+  private func calculateDirectorySize(at url: URL, fileManager: FileManager) -> Int64 {
+    var totalSize: Int64 = 0
+    
+    guard let enumerator = fileManager.enumerator(
+      at: url,
+      includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return 0
+    }
+    
+    for case let fileURL as URL in enumerator {
+      do {
+        let resourceValues = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+        if resourceValues.isDirectory == false {
+          totalSize += Int64(resourceValues.fileSize ?? 0)
+        }
+      } catch {
+        // Skip files we can't read
+        continue
+      }
+    }
+    
+    return totalSize
   }
 
   /// Estimate the remaining download time for a model
@@ -434,6 +693,66 @@ final class ModelManagerViewModel {
     downloadTasks[model.id] = nil
     downloadProgresses.removeValue(forKey: model.id)
     appState?.setStatus(.notDownloaded, for: model)
+  }
+
+  // MARK: - Lightning LoRA Download
+
+  private var lightningLoRATask: Task<Void, Never>?
+
+  func downloadLightningLoRA() async {
+    guard let appState else { return }
+
+    appState.lightningLoRAStatus = .downloading(progress: 0, description: "Starting...")
+
+    let localAppState = appState
+
+    let task = Task {
+      do {
+        _ = try await localAppState.modelService.downloadLightningLoRA { progress in
+          Task { @MainActor in
+            let description: String
+            if let speed = progress.formattedSpeed {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal) @ \(speed)"
+            } else {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal)"
+            }
+
+            localAppState.lightningLoRAStatus = .downloading(
+              progress: progress.fractionCompleted,
+              description: description
+            )
+          }
+        }
+
+        let loraPath = await localAppState.modelService.lightningLoRAPath()
+        await MainActor.run {
+          localAppState.lightningLoRAStatus = .downloaded
+          if let loraPath {
+            localAppState.textToImageViewModel.selectedLoRAPath = loraPath
+            localAppState.editingViewModel.selectedLoRAPath = loraPath
+            localAppState.layeredViewModel.selectedLoRAPath = loraPath
+          }
+        }
+      } catch {
+        await MainActor.run {
+          if Task.isCancelled {
+            localAppState.lightningLoRAStatus = .notDownloaded
+          } else {
+            localAppState.lightningLoRAStatus = .error(error.localizedDescription)
+          }
+        }
+      }
+    }
+
+    lightningLoRATask = task
+    await task.value
+    lightningLoRATask = nil
+  }
+
+  func cancelLightningLoRADownload() {
+    lightningLoRATask?.cancel()
+    lightningLoRATask = nil
+    appState?.lightningLoRAStatus = .notDownloaded
   }
 }
 

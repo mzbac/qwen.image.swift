@@ -90,6 +90,51 @@ actor ModelService {
     return path
   }
 
+  /// Download the Lightning LoRA from HuggingFace
+  func downloadLightningLoRA(
+    progressHandler: @escaping @Sendable (HubSnapshotProgress) -> Void
+  ) async throws -> URL {
+    let repoId = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+    let options = HubSnapshotOptions(
+      repoId: repoId,
+      revision: "main"
+    )
+
+    let snapshot = try HubSnapshot(options: options)
+    let path = try await snapshot.prepare(progressHandler: progressHandler)
+
+    cachedPaths[repoId] = path
+    return path
+  }
+
+  /// Get the HuggingFace hub path respecting HF_HUB_CACHE and HF_HOME environment variables
+  private func hubPath() -> URL {
+    let env = ProcessInfo.processInfo.environment
+    if let hfHubCache = env["HF_HUB_CACHE"], !hfHubCache.isEmpty {
+      return URL(fileURLWithPath: hfHubCache)
+    } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+      return URL(fileURLWithPath: hfHome).appending(path: "hub")
+    } else {
+      return URL(fileURLWithPath: NSHomeDirectory()).appending(path: ".cache/huggingface/hub")
+    }
+  }
+
+  /// Check if Lightning LoRA is installed
+  func isLightningLoRAInstalled() -> Bool {
+    let path = hubPath()
+      .appending(path: "models/lightx2v/Qwen-Image-Edit-2511-Lightning")
+      .appending(path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+    return FileManager.default.fileExists(atPath: path.path)
+  }
+
+  /// Get the Lightning LoRA path if it exists
+  func lightningLoRAPath() -> URL? {
+    let path = hubPath()
+      .appending(path: "models/lightx2v/Qwen-Image-Edit-2511-Lightning")
+      .appending(path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+    return FileManager.default.fileExists(atPath: path.path) ? path : nil
+  }
+
   // MARK: - Session-Based Loading
 
   func loadLayeredSession(

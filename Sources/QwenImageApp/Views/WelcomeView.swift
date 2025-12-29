@@ -29,6 +29,11 @@ struct WelcomeView: View {
       }
       .padding(.horizontal, 40)
 
+      // Lightning LoRA Suggestion (if not installed)
+      if kDefaultLightningLoRAPath == nil {
+        LightningLoRASuggestion()
+      }
+
       Spacer()
 
       // Model Status Footer
@@ -115,6 +120,59 @@ struct ModelStatusFooter: View {
       }
     }
     .padding(.horizontal)
+  }
+}
+
+struct LightningLoRASuggestion: View {
+  @Environment(AppState.self) private var appState
+  @AppStorage("hideLightningLoRASuggestion") private var hideSuggestion = false
+  
+  var body: some View {
+    if !hideSuggestion {
+      HStack(spacing: 12) {
+        Image(systemName: "bolt.fill")
+          .foregroundStyle(.yellow)
+        
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Speed up generation with Lightning LoRA")
+            .font(.caption.bold())
+          Text("Generate in 4 steps instead of 20+")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        
+        Spacer()
+        
+        Button {
+          appState.selectedSidebarItem = .modelManager
+        } label: {
+          Text("Get it")
+            .font(.caption.bold())
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+        
+        Button {
+          hideSuggestion = true
+        } label: {
+          Image(systemName: "xmark")
+            .font(.caption2)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 10)
+      .frame(maxWidth: 500)
+      .background(
+        RoundedRectangle(cornerRadius: 10)
+          .fill(Color.yellow.opacity(0.1))
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 10)
+          .strokeBorder(Color.yellow.opacity(0.3), lineWidth: 1)
+      )
+    }
   }
 }
 

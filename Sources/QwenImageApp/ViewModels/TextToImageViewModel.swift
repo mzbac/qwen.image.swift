@@ -63,7 +63,6 @@ final class TextToImageViewModel {
     let cfgScale = trueCFGScale
     let randomSeed = useRandomSeed
     let seedValue = seed
-    let unloadEncoder = appState.settings.unloadTextEncoderAfterEncoding
     let loraURL = selectedLoRAPath
 
     generationState = .loading
@@ -71,19 +70,6 @@ final class TextToImageViewModel {
 
     generationTask = Task.detached { [weak self] in
       do {
-        let sessionConfig = ImagePipelineSessionConfiguration(
-          releaseEncodersAfterEncoding: unloadEncoder,
-          maxCachedEmbeddings: 10,
-          gpuCacheLimit: nil
-        )
-
-        let session = try await modelService.loadImageSession(
-          from: modelPath,
-          config: .textToImage,
-          configuration: sessionConfig
-        )
-
-        // TODO: Add LoRA support to session API
         let pipeline = try await modelService.loadImagePipeline(
           from: modelPath,
           config: .textToImage
@@ -115,7 +101,8 @@ final class TextToImageViewModel {
           }
         }
 
-        let pixels = try await session.generate(
+        // Use pipeline directly for generation (required for LoRA support)
+        let pixels = try pipeline.generatePixels(
           parameters: params,
           model: modelConfig,
           seed: actualSeed

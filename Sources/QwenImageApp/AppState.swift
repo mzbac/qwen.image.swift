@@ -4,9 +4,19 @@ import QwenImage
 
 /// Default LoRA path for lightning-fast generation
 let kDefaultLightningLoRAPath: URL? = {
-    let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".cache/huggingface/hub/models/lightx2v/Qwen-Image-Edit-2511-Lightning")
-        .appendingPathComponent("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+    let env = ProcessInfo.processInfo.environment
+    let hubPath: URL
+    if let hfHubCache = env["HF_HUB_CACHE"], !hfHubCache.isEmpty {
+        hubPath = URL(fileURLWithPath: hfHubCache)
+    } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+        hubPath = URL(fileURLWithPath: hfHome).appending(path: "hub")
+    } else {
+        hubPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub")
+    }
+    let path = hubPath
+        .appending(path: "models/lightx2v/Qwen-Image-Edit-2511-Lightning")
+        .appending(path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
     return FileManager.default.fileExists(atPath: path.path) ? path : nil
 }()
 
@@ -86,9 +96,9 @@ enum ModelVariant: String, CaseIterable, Identifiable {
 
   var description: String {
     switch self {
-    case .full: return "Best quality, requires ~30GB"
-    case .quantized8bit: return "Good quality, requires ~15GB"
-    case .quantized6bit: return "Smaller size, requires ~11GB"
+    case .full: return "Best quality, original bf16 weights"
+    case .quantized8bit: return "Good quality, 8-bit quantized weights"
+    case .quantized6bit: return "Compact size, 6-bit quantized weights"
     }
   }
 }
@@ -170,6 +180,16 @@ final class AppState {
   var settings = AppSettings()
   var showingError = false
   var errorMessage = ""
+
+  // Lightning LoRA status
+  var lightningLoRAStatus: LightningLoRAStatus = .notDownloaded
+  
+  enum LightningLoRAStatus: Equatable {
+    case notDownloaded
+    case downloading(progress: Double, description: String)
+    case downloaded
+    case error(String)
+  }
 
   // Onboarding state
   var hasCompletedOnboarding: Bool {

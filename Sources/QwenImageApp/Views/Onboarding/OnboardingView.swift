@@ -10,6 +10,7 @@ struct OnboardingView: View {
     .welcome,
     .whatItDoes,
     .modelDownload,
+    .lightningLoRA,
     .workflow,
     .ready
   ]
@@ -40,8 +41,10 @@ struct OnboardingView: View {
       case 2:
         modelDownloadStep
       case 3:
-        workflowStep
+        lightningLoRAStep
       case 4:
+        workflowStep
+      case 5:
         readyStep
       default:
         welcomeStep
@@ -174,6 +177,184 @@ struct OnboardingView: View {
       Spacer()
     }
     .padding(.horizontal, 40)
+  }
+
+  private var lightningLoRAStep: some View {
+    VStack(spacing: 24) {
+      Spacer()
+
+      Image(systemName: "bolt.fill")
+        .font(.system(size: 60))
+        .foregroundStyle(.yellow.gradient)
+
+      VStack(spacing: 12) {
+        Text("Speed Boost (Optional)")
+          .font(.title2.bold())
+
+        Text("The Lightning LoRA enables blazing-fast generation in just 4 steps instead of 20+.\n\nThis is optional but recommended for faster iteration.")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+      }
+
+      // Status based on appState
+      switch appState.lightningLoRAStatus {
+      case .notDownloaded:
+        if kDefaultLightningLoRAPath != nil {
+          installedIndicator
+        } else {
+          downloadButton
+        }
+      case .downloading(let progress, let description):
+        downloadingIndicator(progress: progress, description: description)
+      case .downloaded:
+        installedIndicator
+      case .error(let message):
+        errorIndicator(message: message)
+      }
+
+      Text("You can skip this and download later from Model Manager")
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+
+      Spacer()
+      Spacer()
+    }
+    .padding(.horizontal, 40)
+    .onAppear {
+      // Check if already installed on appear
+      if kDefaultLightningLoRAPath != nil && appState.lightningLoRAStatus == .notDownloaded {
+        appState.lightningLoRAStatus = .downloaded
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var installedIndicator: some View {
+    HStack {
+      Image(systemName: "checkmark.circle.fill")
+        .foregroundStyle(.green)
+      Text("Already installed!")
+        .foregroundStyle(.green)
+    }
+    .padding()
+    .background(
+      RoundedRectangle(cornerRadius: 12)
+        .fill(Color.green.opacity(0.1))
+    )
+  }
+
+  @ViewBuilder
+  private var downloadButton: some View {
+    VStack(spacing: 12) {
+      Button {
+        Task {
+          await downloadLightningLoRA()
+        }
+      } label: {
+        Label("Download Lightning LoRA", systemImage: "arrow.down.circle")
+          .frame(maxWidth: 300)
+      }
+      .buttonStyle(.borderedProminent)
+    }
+  }
+
+  @ViewBuilder
+  private func downloadingIndicator(progress: Double, description: String) -> some View {
+    VStack(spacing: 8) {
+      ProgressView(value: progress)
+        .progressViewStyle(.linear)
+        .frame(maxWidth: 300)
+      
+      HStack {
+        Text(description)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer()
+        Text(String(format: "%.1f%%", progress * 100))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .monospacedDigit()
+      }
+      .frame(maxWidth: 300)
+      
+      Button("Cancel") {
+        cancelLightningLoRADownload()
+      }
+      .buttonStyle(.bordered)
+    }
+  }
+
+  @ViewBuilder
+  private func errorIndicator(message: String) -> some View {
+    VStack(spacing: 8) {
+      HStack {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundStyle(.red)
+        Text(message)
+          .font(.callout)
+          .foregroundStyle(.red)
+      }
+      
+      Button("Retry") {
+        Task {
+          await downloadLightningLoRA()
+        }
+      }
+      .buttonStyle(.borderedProminent)
+    }
+  }
+
+  // MARK: - Lightning LoRA Download
+
+  @State private var lightningLoRATask: Task<Void, Never>?
+
+  private func downloadLightningLoRA() async {
+    appState.lightningLoRAStatus = .downloading(progress: 0, description: "Starting...")
+
+    let localAppState = appState
+
+    let task = Task {
+      do {
+        _ = try await localAppState.modelService.downloadLightningLoRA { progress in
+          Task { @MainActor in
+            let description: String
+            if let speed = progress.formattedSpeed {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal) @ \(speed)"
+            } else {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal)"
+            }
+
+            localAppState.lightningLoRAStatus = .downloading(
+              progress: progress.fractionCompleted,
+              description: description
+            )
+          }
+        }
+
+        await MainActor.run {
+          localAppState.lightningLoRAStatus = .downloaded
+        }
+      } catch {
+        await MainActor.run {
+          if Task.isCancelled {
+            localAppState.lightningLoRAStatus = .notDownloaded
+          } else {
+            localAppState.lightningLoRAStatus = .error(error.localizedDescription)
+          }
+        }
+      }
+    }
+
+    lightningLoRATask = task
+    await task.value
+    lightningLoRATask = nil
+  }
+
+  private func cancelLightningLoRADownload() {
+    lightningLoRATask?.cancel()
+    lightningLoRATask = nil
+    appState.lightningLoRAStatus = .notDownloaded
   }
 
   private var workflowStep: some View {
@@ -310,6 +491,12 @@ struct OnboardingStep {
     title: "How to Use",
     description: "Simple 4-step workflow",
     icon: "arrow.right"
+  )
+
+  static let lightningLoRA = OnboardingStep(
+    title: "Speed Boost",
+    description: "Optional Lightning LoRA",
+    icon: "bolt.fill"
   )
 
   static let ready = OnboardingStep(
