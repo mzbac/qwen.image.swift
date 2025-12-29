@@ -16,3 +16,4 @@ temp/
 *.profraw
 .build
 outputs
+dist

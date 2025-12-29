@@ -42,16 +42,10 @@ jobs:
           cd ./dist/Build/Products/Release
           mkdir -p QwenImageApp.app/Contents/MacOS
           mkdir -p QwenImageApp.app/Contents/Resources
-          cp QwenImageApp QwenImageApp.app/Contents/MacOS/QwenImageApp.bin
-          chmod +x QwenImageApp.app/Contents/MacOS/QwenImageApp.bin
-          cat > QwenImageApp.app/Contents/MacOS/QwenImageApp << 'EOF'
-          #!/bin/bash
-          cd "$(dirname "$0")"
-          exec ./QwenImageApp.bin "$@"
-          EOF
+          cp QwenImageApp QwenImageApp.app/Contents/MacOS/
           chmod +x QwenImageApp.app/Contents/MacOS/QwenImageApp
           cp ${{ github.workspace }}/Resources/Info.plist QwenImageApp.app/Contents/
-          cp mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib QwenImageApp.app/Contents/MacOS/
+          cp -r mlx-swift_Cmlx.bundle QwenImageApp.app/Contents/Resources/
 
       - name: Create DMG
         run: |

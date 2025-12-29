@@ -194,7 +194,10 @@ final class AppState {
   // Onboarding state
   var hasCompletedOnboarding: Bool {
     get { settings.hasCompletedOnboarding }
-    set { settings.hasCompletedOnboarding = newValue }
+    set {
+      settings.hasCompletedOnboarding = newValue
+      settings.save()
+    }
   }
 
   // Shared ViewModels - persisted across navigation
