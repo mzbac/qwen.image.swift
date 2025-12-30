@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import Combine
 import Logging
 import MLX
 import MLXNN
@@ -132,6 +133,7 @@ struct QwenImageCLIEntry {
     var layeredLayers = 4
     var layeredResolution = 640
     var layeredCFGNormalize = true
+    var disableProgress = false
 
     let args = CommandLine.arguments.dropFirst()
     var iterator = args.makeIterator()
@@ -275,6 +277,8 @@ struct QwenImageCLIEntry {
       case "--layered-cfg-normalize":
         let value = nextValue(for: argument, iterator: &iterator).lowercased()
         layeredCFGNormalize = value == "true" || value == "1" || value == "yes"
+      case "--no-progress":
+        disableProgress = true
       case "--help", "-h":
         printUsage()
         return
@@ -282,6 +286,8 @@ struct QwenImageCLIEntry {
         continue
       }
     }
+
+    let progressEnabled = TerminalProgressBar.defaultEnabled() && !disableProgress
 
     if quantAttnBits != nil || quantAttnGroupSize != nil || quantAttnMode != nil {
       let bits = quantAttnBits ?? quantBits ?? 8
@@ -319,7 +325,8 @@ struct QwenImageCLIEntry {
         trueCFGScale: trueCFGScale,
         cfgNormalize: layeredCFGNormalize,
         seed: seed,
-        loraPath: loraArg
+        loraPath: loraArg,
+        progressEnabled: progressEnabled
       )
       return
     }
@@ -427,38 +434,74 @@ struct QwenImageCLIEntry {
       logger.info("Enabled attention quantization override (bits: \(spec.bits), group: \(spec.groupSize), mode: \(spec.mode)).")
     }
 
+    func runDenoiseWithProgressBar(
+      label: String,
+      totalSteps: Int,
+      enabled: Bool,
+      operation: () throws -> MLXArray
+    ) throws -> MLXArray {
+      guard enabled else { return try operation() }
+      let bar = TerminalProgressBar(label: label, enabled: true)
+      let cancellable = pipeline.progress?.sink { info in
+        bar.update(step: info.step, total: info.total)
+      }
+      bar.start(total: totalSteps, renderInitial: true)
+      defer {
+        cancellable?.cancel()
+        bar.finish()
+      }
+      return try operation()
+    }
+
     let pixels: MLXArray
     if !isEdit {
       logger.info("Generating image")
-      pixels = try pipeline.generatePixels(
-        parameters: generation,
-        model: modelConfig,
-        seed: seed
-      )
+      pixels = try runDenoiseWithProgressBar(
+        label: "Denoising",
+        totalSteps: generation.steps,
+        enabled: progressEnabled
+      ) {
+        try pipeline.generatePixels(
+          parameters: generation,
+          model: modelConfig,
+          seed: seed
+        )
+      }
     } else {
 #if canImport(CoreGraphics)
-        guard !referenceImagePaths.isEmpty else {
-          fail("Edit mode requires at least one --reference-image.")
-        }
-        let primaryReference = loadCGImage(at: referenceImagePaths[0])
-        logger.info("Using edit canvas \(generation.width)x\(generation.height)")
-        logger.info("Generating image edit")
-        if referenceImagePaths.count == 1 {
-          pixels = try pipeline.generateEditedPixels(
+      guard !referenceImagePaths.isEmpty else {
+        fail("Edit mode requires at least one --reference-image.")
+      }
+      let primaryReference = loadCGImage(at: referenceImagePaths[0])
+      logger.info("Using edit canvas \(generation.width)x\(generation.height)")
+      logger.info("Generating image edit")
+      if referenceImagePaths.count == 1 {
+        pixels = try runDenoiseWithProgressBar(
+          label: "Denoising (edit)",
+          totalSteps: generation.steps,
+          enabled: progressEnabled
+        ) {
+          try pipeline.generateEditedPixels(
             parameters: generation,
             model: modelConfig,
             referenceImage: primaryReference,
             maxPromptLength: nil,
             seed: seed
           )
-        } else {
-          var images: [CGImage] = [primaryReference]
-          if referenceImagePaths.count > 2 {
-            logger.warning("Received \(referenceImagePaths.count) reference images; only the first two will be used.")
-          }
-          let second = loadCGImage(at: referenceImagePaths[1])
-          images.append(second)
-          pixels = try pipeline.generateEditedPixels(
+        }
+      } else {
+        var images: [CGImage] = [primaryReference]
+        if referenceImagePaths.count > 2 {
+          logger.warning("Received \(referenceImagePaths.count) reference images; only the first two will be used.")
+        }
+        let second = loadCGImage(at: referenceImagePaths[1])
+        images.append(second)
+        pixels = try runDenoiseWithProgressBar(
+          label: "Denoising (edit)",
+          totalSteps: generation.steps,
+          enabled: progressEnabled
+        ) {
+          try pipeline.generateEditedPixels(
             parameters: generation,
             model: modelConfig,
             referenceImages: images,
@@ -466,8 +509,9 @@ struct QwenImageCLIEntry {
             seed: seed
           )
         }
+      }
 #else
-        fail("Native edit mode requires CoreGraphics support on this platform.")
+      fail("Native edit mode requires CoreGraphics support on this platform.")
 #endif
     }
 
@@ -764,6 +808,7 @@ struct QwenImageCLIEntry {
       --lora                  Optional LoRA safetensors path, HF repo ID, or HF file URL (e.g. Osrivers/Qwen-Image-Lightning-4steps-V2.0-bf16.safetensors or repo:file.safetensors)
       --revision              Snapshot revision/tag/commit (used with HF repo IDs; default: main)
       --output, -o            Output PNG path (default: qwen-image.png)
+      --no-progress           Disable the interactive progress bar
 
       Output format is inferred from extension: .png, .bmp, .tiff, .jpg
       Use .bmp or .tiff for faster saves during benchmarking.
@@ -818,7 +863,8 @@ struct QwenImageCLIEntry {
     trueCFGScale: Float?,
     cfgNormalize: Bool,
     seed: UInt64?,
-    loraPath: String?
+    loraPath: String?,
+    progressEnabled: Bool
   ) throws {
 #if canImport(CoreGraphics)
     logger.info("Loading layered pipeline from \(snapshotRoot.path)")
@@ -855,10 +901,15 @@ struct QwenImageCLIEntry {
 
     logger.info("Generating \(layers) layers at \(resolution)x\(resolution) with \(steps) steps")
 
-    let layerImages = try pipeline.generate(
-      image: inputArray,
-      parameters: parameters
-    ) { _, _, _ in
+    let layerImages: [MLXArray]
+    if progressEnabled {
+      let progressBar = TerminalProgressBar(label: "Denoising (layered)", enabled: true)
+      defer { progressBar.finish() }
+      layerImages = try pipeline.generate(image: inputArray, parameters: parameters) { step, total, _ in
+        progressBar.update(step: step, total: total)
+      }
+    } else {
+      layerImages = try pipeline.generate(image: inputArray, parameters: parameters)
     }
 
     let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL

@@ -215,7 +215,7 @@ final class LayeredViewModel {
           parameters: params
         ) { step, total, progress in
           Task { @MainActor in
-            weakSelf?.generationState = .generating(step: step + 1, total: total, progress: progress)
+            weakSelf?.generationState = .generating(step: step, total: total, progress: progress)
           }
         }
         logger.info("Task \(taskId): Generation complete, got \(layerArrays.count) layers")
