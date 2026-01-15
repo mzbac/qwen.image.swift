@@ -42,22 +42,88 @@ actor ModelService {
       hubPath = URL(fileURLWithPath: NSHomeDirectory()).appending(path: ".cache/huggingface/hub")
     }
 
+    if let snapshotDir = resolveHuggingFaceCliSnapshotURL(
+      hubPath: hubPath,
+      repoId: repoId,
+      revision: currentRevision,
+      fileManager: FileManager.default
+    ), isValidModelSnapshot(snapshotDir) {
+      cachedPaths[repoId] = snapshotDir
+      return snapshotDir
+    }
+
     let modelDir = hubPath.appending(path: "models").appending(path: repoId)
 
-    guard FileManager.default.fileExists(atPath: modelDir.path) else {
+    guard isValidModelSnapshot(modelDir) else {
       return nil
     }
 
-    do {
-      let contents = try FileManager.default.contentsOfDirectory(atPath: modelDir.path)
-      if contents.isEmpty {
-        return nil
-      }
-      cachedPaths[repoId] = modelDir
-      return modelDir
-    } catch {
+    cachedPaths[repoId] = modelDir
+    return modelDir
+  }
+
+  private func isValidModelSnapshot(_ url: URL) -> Bool {
+    FileManager.default.fileExists(atPath: url.appending(path: "model_index.json").path)
+  }
+
+  private func resolveHuggingFaceCliSnapshotURL(
+    hubPath: URL,
+    repoId: String,
+    revision: String,
+    fileManager: FileManager
+  ) -> URL? {
+    // huggingface-cli (huggingface_hub) cache layout:
+    //   <HF_HUB_CACHE>/
+    //     models--<org>--<repo>/
+    //       refs/<revision>          (contains commit hash)
+    //       snapshots/<commitHash>/  (materialized snapshot)
+    let repoDirectoryName = "models--" + repoId.replacingOccurrences(of: "/", with: "--")
+    let repoDirectory = hubPath.appending(path: repoDirectoryName)
+
+    var isRepoDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: repoDirectory.path, isDirectory: &isRepoDirectory),
+          isRepoDirectory.boolValue
+    else {
       return nil
     }
+
+    let commitHash: String?
+    if isCommitHash(revision) {
+      commitHash = revision.lowercased()
+    } else {
+      let refFile = repoDirectory
+        .appending(path: "refs")
+        .appending(path: revision)
+      guard fileManager.fileExists(atPath: refFile.path),
+            let contents = try? String(contentsOf: refFile, encoding: .utf8)
+      else {
+        return nil
+      }
+      let hash = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+      commitHash = isCommitHash(hash) ? hash.lowercased() : nil
+    }
+
+    guard let commitHash else { return nil }
+
+    let snapshotDirectory = repoDirectory
+      .appending(path: "snapshots")
+      .appending(path: commitHash)
+
+    var isSnapshotDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: snapshotDirectory.path, isDirectory: &isSnapshotDirectory),
+          isSnapshotDirectory.boolValue
+    else {
+      return nil
+    }
+
+    return snapshotDirectory
+  }
+
+  private func isCommitHash(_ value: String) -> Bool {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count == 40 else { return false }
+    let hexSet = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+    return trimmed.unicodeScalars.allSatisfy { hexSet.contains($0) }
   }
 
   // MARK: - Download

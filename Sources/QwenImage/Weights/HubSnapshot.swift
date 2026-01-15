@@ -53,6 +53,7 @@ public actor HubSnapshot {
 
   private let options: HubSnapshotOptions
   private let hubApi: HubApi
+  private let cacheDirectory: URL
   private var cachedSnapshotURL: URL?
 
   public init(
@@ -65,6 +66,7 @@ public actor HubSnapshot {
       requested: options.cacheDirectory,
       fileManager: FileManager.default
     )
+    self.cacheDirectory = cacheDirectory
 
     let api = hubApi ?? HubApi(
       downloadBase: cacheDirectory,
@@ -80,6 +82,17 @@ public actor HubSnapshot {
     if let cachedSnapshotURL,
       FileManager.default.fileExists(atPath: cachedSnapshotURL.path) {
       return cachedSnapshotURL
+    }
+
+    if let snapshotURL = Self.resolveHuggingFaceCliSnapshotURL(
+      cacheDirectory: cacheDirectory,
+      repoId: options.repoId,
+      repoType: options.repoType,
+      revision: options.revision,
+      fileManager: FileManager.default
+    ) {
+      cachedSnapshotURL = snapshotURL
+      return snapshotURL
     }
 
     let repo = Hub.Repo(id: options.repoId, type: options.repoType)
@@ -110,6 +123,93 @@ public actor HubSnapshot {
 
   public func invalidateCache() {
     cachedSnapshotURL = nil
+  }
+
+  private static func resolveHuggingFaceCliSnapshotURL(
+    cacheDirectory: URL,
+    repoId: String,
+    repoType: Hub.RepoType,
+    revision: String,
+    fileManager: FileManager
+  ) -> URL? {
+    // huggingface-cli (huggingface_hub) cache layout:
+    //   <HF_HUB_CACHE>/
+    //     models--<org>--<repo>/
+    //       refs/<revision>          (contains commit hash)
+    //       snapshots/<commitHash>/  (materialized snapshot)
+    //
+    // This differs from swift-transformers' HubApi layout:
+    //   <downloadBase>/<repoType>/<repoId>/
+    let repoDirectoryName = "\(repoType.rawValue)--\(repoId.replacingOccurrences(of: "/", with: "--"))"
+    let repoDirectory = cacheDirectory.appending(path: repoDirectoryName)
+
+    var isRepoDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: repoDirectory.path, isDirectory: &isRepoDirectory),
+          isRepoDirectory.boolValue
+    else {
+      return nil
+    }
+
+    let commitHash: String?
+    if isCommitHash(revision) {
+      commitHash = revision.lowercased()
+    } else {
+      commitHash = resolveCommitHash(
+        revision: revision,
+        repoDirectory: repoDirectory,
+        fileManager: fileManager
+      )
+    }
+
+    guard let commitHash else { return nil }
+
+    let snapshotDirectory = repoDirectory
+      .appending(path: "snapshots")
+      .appending(path: commitHash)
+
+    var isSnapshotDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: snapshotDirectory.path, isDirectory: &isSnapshotDirectory),
+          isSnapshotDirectory.boolValue
+    else {
+      return nil
+    }
+
+    return snapshotDirectory
+  }
+
+  private static func resolveCommitHash(
+    revision: String,
+    repoDirectory: URL,
+    fileManager: FileManager
+  ) -> String? {
+    let refsDirectory = repoDirectory.appending(path: "refs")
+
+    var candidates = [revision]
+    if revision.hasPrefix("refs/") {
+      let trimmed = String(revision.dropFirst("refs/".count))
+      if !trimmed.isEmpty {
+        candidates.append(trimmed)
+      }
+    }
+
+    for candidate in candidates {
+      let refFile = refsDirectory.appending(path: candidate)
+      guard fileManager.fileExists(atPath: refFile.path) else { continue }
+      guard let contents = try? String(contentsOf: refFile, encoding: .utf8) else { continue }
+      let hash = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+      if isCommitHash(hash) {
+        return hash.lowercased()
+      }
+    }
+
+    return nil
+  }
+
+  private static func isCommitHash(_ value: String) -> Bool {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count == 40 else { return false }
+    let hexSet = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+    return trimmed.unicodeScalars.allSatisfy { hexSet.contains($0) }
   }
 
   private static func resolveCacheDirectory(
