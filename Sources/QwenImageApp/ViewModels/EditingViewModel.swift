@@ -3,7 +3,6 @@ import SwiftUI
 import QwenImage
 import QwenImageRuntime
 import MLX
-import Combine
 
 @Observable @MainActor
 final class EditingViewModel {
@@ -32,7 +31,6 @@ final class EditingViewModel {
     }
   }
   private var generationTask: Task<Void, Never>?
-  private var progressCancellable: AnyCancellable?
   var appState: AppState?
 
   init() {
@@ -91,19 +89,23 @@ final class EditingViewModel {
     let randomSeed = useRandomSeed
     let seedValue = seed
     let loraURL = selectedLoRAPath
+    let loraScaleValue = loraScale
+    let modelVariant = appState.selectedVariant(for: .edit)
+    let modelRepoId = ModelDefinition.edit.repoId(for: modelVariant)
 
     generationState = .loading
     editedImage = nil
 
     generationTask = Task.detached { [weak self] in
       do {
-        let pipeline = try await modelService.loadImagePipeline(
+        let session = try await modelService.loadImageSession(
           from: modelPath,
-          config: .imageEditing
+          config: .imageEditing,
+          modelId: modelRepoId
         )
 
         if let url = loraURL {
-          pipeline.setPendingLora(from: url, scale: 1.0)
+          try await modelService.applyLoRAToImageSession(from: url, scale: loraScaleValue)
         }
 
         var cgImages: [CGImage] = []
@@ -129,20 +131,18 @@ final class EditingViewModel {
           editResolution: editRes
         )
 
-        let modelConfig = QwenModelConfiguration()
+        var modelConfig = QwenModelConfiguration()
+        let descriptor = try await session.loadModelDescriptor()
+        modelConfig.flowMatch = descriptor.flowMatchConfiguration
+        modelConfig.requiresSigmaShift = false
 
         await MainActor.run { [weak self] in
           self?.generationState = .generating(step: 0, total: stepCount, progress: 0)
-          self?.progressCancellable = pipeline.progress?.receive(on: DispatchQueue.main).sink { [weak self] info in
-            guard let self else { return }
-            let progress = Float(info.step) / Float(info.total)
-            self.generationState = .generating(step: info.step, total: info.total, progress: progress)
-          }
         }
 
-        let pixels: MLXArray
+        let stream: AsyncThrowingStream<QwenGenerationEvent, Error>
         if cgImages.count == 1 {
-          pixels = try pipeline.generateEditedPixels(
+          stream = await session.generateEditedPixelsStream(
             parameters: params,
             model: modelConfig,
             referenceImage: cgImages[0],
@@ -150,7 +150,7 @@ final class EditingViewModel {
             seed: actualSeed
           )
         } else {
-          pixels = try pipeline.generateEditedPixels(
+          stream = await session.generateEditedPixelsStream(
             parameters: params,
             model: modelConfig,
             referenceImages: cgImages,
@@ -159,19 +159,34 @@ final class EditingViewModel {
           )
         }
 
+        var pixels: MLXArray?
+        for try await event in stream {
+          switch event {
+          case .progress(let info):
+            let fraction = Float(info.step) / Float(info.total)
+            Task { @MainActor [weak self] in
+              self?.generationState = .generating(step: info.step, total: info.total, progress: fraction)
+            }
+          case .output(let outputPixels):
+            pixels = outputPixels
+          }
+        }
+
+        guard let pixels else {
+          throw EditingError.generationDidNotProduceOutput
+        }
+
         if Task.isCancelled {
           await MainActor.run { [weak self] in
-            self?.progressCancellable = nil
             self?.generationState = .idle
           }
           return
         }
 
-        let image = try pipeline.makeImage(from: pixels)
+        let image = try await session.makeImage(from: pixels)
 
         await MainActor.run { [weak self] in
           guard let self else { return }
-          self.progressCancellable = nil
           self.editedImage = image
           self.generationState = .complete
           if randomSeed {
@@ -182,7 +197,6 @@ final class EditingViewModel {
       } catch {
         await MainActor.run { [weak self] in
           guard let self else { return }
-          self.progressCancellable = nil
           if Task.isCancelled {
             self.generationState = .idle
           } else {
@@ -196,7 +210,6 @@ final class EditingViewModel {
   func cancelGeneration() {
     generationTask?.cancel()
     generationTask = nil
-    progressCancellable = nil
     generationState = .idle
   }
 
@@ -217,6 +230,7 @@ final class EditingViewModel {
 enum EditingError: LocalizedError {
   case invalidReferenceImages
   case noImageToExport
+  case generationDidNotProduceOutput
 
   var errorDescription: String? {
     switch self {
@@ -224,6 +238,8 @@ enum EditingError: LocalizedError {
       return "Failed to process reference images"
     case .noImageToExport:
       return "No image to export. Generate an edit first."
+    case .generationDidNotProduceOutput:
+      return "Generation did not produce an output image."
     }
   }
 }

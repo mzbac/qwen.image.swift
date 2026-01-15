@@ -9,6 +9,7 @@ struct QwenImageApp: App {
 
   init() {
     Self.configureGPULimits()
+    Self.applyUserGPULimitOverride()
   }
 
   var body: some Scene {
@@ -62,6 +63,12 @@ struct QwenImageApp: App {
     } else {
       MLX.GPU.set(cacheLimit: 16 * 1024 * 1024 * 1024)
     }
+  }
+
+  private static nonisolated func applyUserGPULimitOverride() {
+    let settings = AppSettings.load()
+    let limitGB = max(1, settings.gpuCacheLimitGB)
+    MLX.GPU.set(cacheLimit: limitGB * 1024 * 1024 * 1024)
   }
 }
 

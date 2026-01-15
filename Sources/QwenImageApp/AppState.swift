@@ -3,22 +3,40 @@ import SwiftUI
 import QwenImage
 
 /// Default LoRA path for lightning-fast generation
-let kDefaultLightningLoRAPath: URL? = {
-    let env = ProcessInfo.processInfo.environment
-    let hubPath: URL
-    if let hfHubCache = env["HF_HUB_CACHE"], !hfHubCache.isEmpty {
-        hubPath = URL(fileURLWithPath: hfHubCache)
-    } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
-        hubPath = URL(fileURLWithPath: hfHome).appending(path: "hub")
-    } else {
-        hubPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache/huggingface/hub")
-    }
-    let path = hubPath
-        .appending(path: "models/lightx2v/Qwen-Image-Edit-2511-Lightning")
-        .appending(path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
-    return FileManager.default.fileExists(atPath: path.path) ? path : nil
-}()
+var kDefaultLightningLoRAPath: URL? {
+  let env = ProcessInfo.processInfo.environment
+  let hubPath: URL
+  if let hfHubCache = env["HF_HUB_CACHE"], !hfHubCache.isEmpty {
+    hubPath = URL(fileURLWithPath: hfHubCache)
+  } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+    hubPath = URL(fileURLWithPath: hfHome).appending(path: "hub")
+  } else {
+    hubPath = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".cache/huggingface/hub")
+  }
+  let path = hubPath
+    .appending(path: "models/lightx2v/Qwen-Image-Edit-2511-Lightning")
+    .appending(path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+  return FileManager.default.fileExists(atPath: path.path) ? path : nil
+}
+
+/// Default LoRA path for lightning-fast text-to-image generation (Qwen-Image-2512).
+var kDefaultTextToImageLightningLoRAPath: URL? {
+  let env = ProcessInfo.processInfo.environment
+  let hubPath: URL
+  if let hfHubCache = env["HF_HUB_CACHE"], !hfHubCache.isEmpty {
+    hubPath = URL(fileURLWithPath: hfHubCache)
+  } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+    hubPath = URL(fileURLWithPath: hfHome).appending(path: "hub")
+  } else {
+    hubPath = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".cache/huggingface/hub")
+  }
+  let path = hubPath
+    .appending(path: "models/lightx2v/Qwen-Image-2512-Lightning")
+    .appending(path: "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors")
+  return FileManager.default.fileExists(atPath: path.path) ? path : nil
+}
 
 enum SidebarItem: Hashable, Identifiable {
   case mode(GenerationMode)
@@ -135,8 +153,7 @@ struct ModelDefinition: Identifiable, Equatable {
     modes: [.layered],
     variantRepoIds: [
       .full: "Qwen/Qwen-Image-Layered",
-      .quantized8bit: "mzbac/Qwen-Image-Layered-8bit",
-      .quantized6bit: "mzbac/Qwen-Image-Layered-6bit"
+      .quantized8bit: "mzbac/Qwen-Image-Layered-8bit"
     ]
   )
 
@@ -144,15 +161,27 @@ struct ModelDefinition: Identifiable, Equatable {
     id: "edit",
     name: "Qwen-Image-Edit",
     baseSize: "~54GB",
-    description: "Text-to-image generation and image editing model",
-    modes: [.textToImage, .editing],
+    description: "Image editing model",
+    modes: [.editing],
     variantRepoIds: [
-      .full: "Qwen/Qwen-Image-Edit-2509",
-      .quantized8bit: "mzbac/Qwen-Image-Edit-2509-8bit"
+      .full: "Qwen/Qwen-Image-Edit-2511",
+      .quantized8bit: "mzbac/Qwen-Image-Edit-2511-8bit"
     ]
   )
 
-  static let all: [ModelDefinition] = [.layered, .edit]
+  static let textToImage = ModelDefinition(
+    id: "textToImage",
+    name: "Qwen-Image-2512",
+    baseSize: "~80GB",
+    description: "Text-to-image generation model (optimized 8-bit by default)",
+    modes: [.textToImage],
+    variantRepoIds: [
+      .full: "Qwen/Qwen-Image-2512",
+      .quantized8bit: "mzbac/Qwen-Image-2512-8bit"
+    ]
+  )
+
+  static let all: [ModelDefinition] = [.layered, .textToImage, .edit]
 }
 
 @Observable @MainActor
@@ -168,10 +197,12 @@ final class AppState {
 
   var modelStatuses: [String: ModelStatus] = [
     ModelDefinition.layered.id: .notDownloaded,
+    ModelDefinition.textToImage.id: .notDownloaded,
     ModelDefinition.edit.id: .notDownloaded
   ]
   var selectedVariants: [String: ModelVariant] = [
     ModelDefinition.layered.id: .quantized8bit,
+    ModelDefinition.textToImage.id: .quantized8bit,
     ModelDefinition.edit.id: .quantized8bit
   ]
   var downloadedVariants: [String: Set<ModelVariant>] = [:]
@@ -183,6 +214,7 @@ final class AppState {
 
   // Lightning LoRA status
   var lightningLoRAStatus: LightningLoRAStatus = .notDownloaded
+  var textToImageLightningLoRAStatus: LightningLoRAStatus = .notDownloaded
   
   enum LightningLoRAStatus: Equatable {
     case notDownloaded
@@ -313,7 +345,10 @@ final class AppState {
   }
 
   func selectedVariant(for model: ModelDefinition) -> ModelVariant {
-    selectedVariants[model.id] ?? .quantized8bit
+    if let selected = selectedVariants[model.id], model.variantRepoIds[selected] != nil {
+      return selected
+    }
+    return model.availableVariants.first ?? .full
   }
 
   func setSelectedVariant(_ variant: ModelVariant, for model: ModelDefinition) {
@@ -411,7 +446,9 @@ final class AppState {
     switch mode {
     case .layered:
       return .layered
-    case .textToImage, .editing:
+    case .textToImage:
+      return .textToImage
+    case .editing:
       return .edit
     }
   }
@@ -430,6 +467,9 @@ struct AppSettings: Codable, Equatable {
   /// Set to false to keep it in memory for faster generation with different prompts.
   var unloadTextEncoderAfterEncoding: Bool = true
 
+  /// MLX GPU cache limit in GB.
+  var gpuCacheLimitGB: Int = 2
+
   /// Selected model variant per model ID (persisted)
   var selectedVariants: [String: String] = [:]
 
@@ -437,6 +477,37 @@ struct AppSettings: Codable, Equatable {
   var hasCompletedOnboarding: Bool = false
 
   private static let key = "AppSettings"
+
+  private enum CodingKeys: String, CodingKey {
+    case defaultLayers
+    case defaultResolution
+    case defaultSteps
+    case defaultCFGScale
+    case quantizationEnabled
+    case quantizationBits
+    case showAdvancedOptions
+    case unloadTextEncoderAfterEncoding
+    case gpuCacheLimitGB
+    case selectedVariants
+    case hasCompletedOnboarding
+  }
+
+  init() {}
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    defaultLayers = try container.decodeIfPresent(Int.self, forKey: .defaultLayers) ?? 4
+    defaultResolution = try container.decodeIfPresent(Int.self, forKey: .defaultResolution) ?? 640
+    defaultSteps = try container.decodeIfPresent(Int.self, forKey: .defaultSteps) ?? 50
+    defaultCFGScale = try container.decodeIfPresent(Float.self, forKey: .defaultCFGScale) ?? 4.0
+    quantizationEnabled = try container.decodeIfPresent(Bool.self, forKey: .quantizationEnabled) ?? false
+    quantizationBits = try container.decodeIfPresent(Int.self, forKey: .quantizationBits) ?? 8
+    showAdvancedOptions = try container.decodeIfPresent(Bool.self, forKey: .showAdvancedOptions) ?? false
+    unloadTextEncoderAfterEncoding = try container.decodeIfPresent(Bool.self, forKey: .unloadTextEncoderAfterEncoding) ?? true
+    gpuCacheLimitGB = max(1, try container.decodeIfPresent(Int.self, forKey: .gpuCacheLimitGB) ?? 2)
+    selectedVariants = try container.decodeIfPresent([String: String].self, forKey: .selectedVariants) ?? [:]
+    hasCompletedOnboarding = try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false
+  }
 
   static func load() -> AppSettings {
     guard let data = UserDefaults.standard.data(forKey: key),

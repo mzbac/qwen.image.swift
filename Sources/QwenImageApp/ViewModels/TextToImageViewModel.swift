@@ -3,16 +3,22 @@ import SwiftUI
 import QwenImage
 import QwenImageRuntime
 import MLX
-import Combine
 
 @Observable @MainActor
 final class TextToImageViewModel {
+  private enum LightningDefaults {
+    static let steps: Int = 4
+    static let guidanceScale: Float = 1.0
+    static let trueCFGScale: Float = 1.0
+    static let loraFilenameSubstring: String = "Lightning-4steps"
+  }
+
   var prompt: String = ""
   var negativePrompt: String = ""
 
-  var width: Int = 1024
-  var height: Int = 1024
-  var steps: Int = 4
+  var width: Int = 512
+  var height: Int = 512
+  var steps: Int = 20
   var guidanceScale: Float = 1.0
   var trueCFGScale: Float = 1.0
   var seed: UInt64? = nil
@@ -21,6 +27,7 @@ final class TextToImageViewModel {
   var showAdvancedOptions: Bool = false
   var selectedLoRAPath: URL? = nil
   var loraScale: Float = 1.0
+  private var didAutoApplyLightningDefaults = false
 
   var generatedImage: NSImage?
   var generationState: GenerationState = .idle {
@@ -31,11 +38,25 @@ final class TextToImageViewModel {
   private var generationTask: Task<Void, Never>?
 
   init() {
-    selectedLoRAPath = kDefaultLightningLoRAPath
+    selectedLoRAPath = kDefaultTextToImageLightningLoRAPath
+    applyLightningDefaultsIfNeeded()
   }
-
-  private var progressCancellable: AnyCancellable?
   var appState: AppState?
+
+  func applyLightningDefaultsIfNeeded() {
+    let isLightningLoRASelected =
+      selectedLoRAPath?.lastPathComponent.contains(LightningDefaults.loraFilenameSubstring) == true
+
+    if isLightningLoRASelected {
+      guard !didAutoApplyLightningDefaults else { return }
+      steps = LightningDefaults.steps
+      guidanceScale = LightningDefaults.guidanceScale
+      trueCFGScale = LightningDefaults.trueCFGScale
+      didAutoApplyLightningDefaults = true
+    } else {
+      didAutoApplyLightningDefaults = false
+    }
+  }
 
   func generate() {
     guard !prompt.isEmpty else {
@@ -48,8 +69,8 @@ final class TextToImageViewModel {
       return
     }
 
-    guard let modelPath = appState.modelPath(for: .edit) else {
-      generationState = .error("Image model not downloaded. Please download it first.")
+    guard let modelPath = appState.modelPath(for: .textToImage) else {
+      generationState = .error("Text-to-image model not downloaded. Please download it first.")
       return
     }
 
@@ -64,18 +85,22 @@ final class TextToImageViewModel {
     let randomSeed = useRandomSeed
     let seedValue = seed
     let loraURL = selectedLoRAPath
+    let loraScaleValue = loraScale
+    let modelVariant = appState.selectedVariant(for: .textToImage)
+    let modelRepoId = ModelDefinition.textToImage.repoId(for: modelVariant)
 
     generationState = .loading
     generatedImage = nil
 
     generationTask = Task.detached { [weak self] in
       do {
-        let pipeline = try await modelService.loadImagePipeline(
+        let session = try await modelService.loadImageSession(
           from: modelPath,
-          config: .textToImage
+          config: .textToImage,
+          modelId: modelRepoId
         )
         if let url = loraURL {
-          pipeline.setPendingLora(from: url, scale: 1.0)
+          try await modelService.applyLoRAToImageSession(from: url, scale: loraScaleValue)
         }
 
         let actualSeed = randomSeed ? UInt64.random(in: 0...UInt64.max) : seedValue
@@ -90,37 +115,43 @@ final class TextToImageViewModel {
           trueCFGScale: cfgScale
         )
 
-        let modelConfig = QwenModelConfiguration()
+        var modelConfig = QwenModelConfiguration()
+        let descriptor = try await session.loadModelDescriptor()
+        modelConfig.flowMatch = descriptor.flowMatchConfiguration
+        modelConfig.requiresSigmaShift = false
 
         await MainActor.run { [weak self] in
           self?.generationState = .generating(step: 0, total: stepCount, progress: 0)
-          self?.progressCancellable = pipeline.progress?.receive(on: DispatchQueue.main).sink { [weak self] info in
-            guard let self else { return }
-            let progress = Float(info.step) / Float(info.total)
-            self.generationState = .generating(step: info.step, total: info.total, progress: progress)
+        }
+
+        var pixels: MLXArray?
+        for try await event in await session.generateStream(parameters: params, model: modelConfig, seed: actualSeed) {
+          switch event {
+          case .progress(let info):
+            let fraction = Float(info.step) / Float(info.total)
+            Task { @MainActor [weak self] in
+              self?.generationState = .generating(step: info.step, total: info.total, progress: fraction)
+            }
+          case .output(let outputPixels):
+            pixels = outputPixels
           }
         }
 
-        // Use pipeline directly for generation (required for LoRA support)
-        let pixels = try pipeline.generatePixels(
-          parameters: params,
-          model: modelConfig,
-          seed: actualSeed
-        )
+        guard let pixels else {
+          throw TextToImageError.generationDidNotProduceOutput
+        }
 
         if Task.isCancelled {
           await MainActor.run { [weak self] in
-            self?.progressCancellable = nil
             self?.generationState = .idle
           }
           return
         }
 
-        let image = try pipeline.makeImage(from: pixels)
+        let image = try await session.makeImage(from: pixels)
 
         await MainActor.run { [weak self] in
           guard let self else { return }
-          self.progressCancellable = nil
           self.generatedImage = image
           self.generationState = .complete
           if randomSeed {
@@ -131,7 +162,6 @@ final class TextToImageViewModel {
       } catch {
         await MainActor.run { [weak self] in
           guard let self else { return }
-          self.progressCancellable = nil
           if Task.isCancelled {
             self.generationState = .idle
           } else {
@@ -145,7 +175,6 @@ final class TextToImageViewModel {
   func cancelGeneration() {
     generationTask?.cancel()
     generationTask = nil
-    progressCancellable = nil
     generationState = .idle
   }
 
@@ -164,11 +193,14 @@ final class TextToImageViewModel {
 
 enum TextToImageError: LocalizedError {
   case noImageToExport
+  case generationDidNotProduceOutput
 
   var errorDescription: String? {
     switch self {
     case .noImageToExport:
       return "No image to export. Generate an image first."
+    case .generationDidNotProduceOutput:
+      return "Generation did not produce an output image."
     }
   }
 }

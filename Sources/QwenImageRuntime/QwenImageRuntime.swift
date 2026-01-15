@@ -49,6 +49,19 @@
 /// let pixels = try await session.generate(parameters: params, model: modelConfig)
 /// ```
 ///
+/// ### Streaming Progress
+///
+/// ```swift
+/// for try await event in session.generateStream(parameters: params, model: modelConfig) {
+///   switch event {
+///   case .progress(let info):
+///     print("Step \\(info.step)/\\(info.total)")
+///   case .output(let pixels):
+///     print("Done: \\(pixels.shape)")
+///   }
+/// }
+/// ```
+///
 /// ### Layered Image Generation
 ///
 /// ```swift
@@ -75,6 +88,17 @@
 ///   image: imageArray,
 ///   parameters: params
 /// )
+/// ```
+///
+/// ```swift
+/// for try await event in session.generateStream(imageData: imageData, image: imageArray, parameters: params) {
+///   switch event {
+///   case .progress(let info):
+///     print("Step \\(info.step)/\\(info.total)")
+///   case .output(let layers):
+///     print("Layers: \\(layers.count)")
+///   }
+/// }
 /// ```
 ///
 /// ### GPU Memory Management

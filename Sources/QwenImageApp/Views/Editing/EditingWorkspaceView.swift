@@ -70,6 +70,13 @@ struct EditingWorkspaceView: View {
         appState.showError(error.localizedDescription)
       }
     }
+    .onChange(of: viewModel.selectedLoRAPath) { _, _ in
+      guard !viewModel.generationState.isGenerating else { return }
+      Task {
+        guard await appState.modelService.hasImageSession else { return }
+        await appState.modelService.unloadImagePipeline()
+      }
+    }
   }
 
   private func handleImagePicker(_ result: Result<[URL], Error>, viewModel: EditingViewModel) {

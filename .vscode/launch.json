@@ -19,6 +19,26 @@
             "target": "QwenImageCLI",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release QwenImageCLI"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:qwen.image.swift}",
+            "name": "Debug QwenImageApp",
+            "target": "QwenImageApp",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QwenImageApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:qwen.image.swift}",
+            "name": "Release QwenImageApp",
+            "target": "QwenImageApp",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QwenImageApp"
         }
     ]
 }

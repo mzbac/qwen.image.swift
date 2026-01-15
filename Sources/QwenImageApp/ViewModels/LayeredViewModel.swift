@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import QwenImage
+import QwenImageRuntime
 import MLX
 import Logging
 
@@ -137,8 +138,6 @@ final class LayeredViewModel {
     trueCFGScale = settings.defaultCFGScale
     showAdvancedOptions = settings.showAdvancedOptions
 
-    selectedLoRAPath = kDefaultLightningLoRAPath
-
     for preset in GenerationPreset.allCases where preset != .custom {
       if preset.matches(layers: layers, steps: steps, resolution: resolution, cfgScale: trueCFGScale) {
         selectedPreset = preset
@@ -176,6 +175,9 @@ final class LayeredViewModel {
     let cfgNorm = cfgNormalize
     let randomSeed = useRandomSeed
     let seedValue = seed
+    let inputURL = inputImageURL
+    let modelVariant = appState.selectedVariant(for: .layered)
+    let modelRepoId = ModelDefinition.layered.repoId(for: modelVariant)
 
     generationState = .loading
     generatedLayers = []
@@ -185,16 +187,25 @@ final class LayeredViewModel {
       logger.info("Task \(taskId): Starting generation... layers=\(layerCount), resolution=\(resolutionValue), steps=\(stepCount)")
 
       do {
-        logger.info("Task \(taskId): Loading pipeline from \(modelPath.path)")
-        let pipeline = try await modelService.loadLayeredPipeline(from: modelPath)
-        logger.info("Task \(taskId): Pipeline loaded successfully")
+        logger.info("Task \(taskId): Loading session from \(modelPath.path)")
+        let session = try await modelService.loadLayeredSession(
+          from: modelPath,
+          modelId: modelRepoId
+        )
+        logger.info("Task \(taskId): Session loaded successfully")
 
         if let loraPath {
-          try await modelService.applyLoRA(to: pipeline, from: loraPath, scale: loraScaleValue)
+          try await modelService.applyLoRAToLayeredSession(from: loraPath, scale: loraScaleValue)
         }
 
         let cgImage = try ImageIOService.cgImage(from: inputImage)
         let inputArray = ImageIOService.cgImageToMLXArray(cgImage)
+        let imageData: Data
+        if let inputURL {
+          imageData = try Data(contentsOf: inputURL)
+        } else {
+          imageData = try ImageIOService.pngData(from: cgImage)
+        }
 
         let actualSeed = randomSeed ? UInt64.random(in: 0...UInt64.max) : seedValue
         let params = LayeredGenerationParameters(
@@ -208,16 +219,27 @@ final class LayeredViewModel {
           seed: actualSeed
         )
 
-        let weakSelf = self
-        logger.info("Task \(taskId): Starting pipeline.generate()...")
-        let layerArrays = try pipeline.generate(
-          image: inputArray,
-          parameters: params
-        ) { step, total, progress in
-          Task { @MainActor in
-            weakSelf?.generationState = .generating(step: step + 1, total: total, progress: progress)
+        logger.info("Task \(taskId): Starting session.generateStream()...")
+        var layerArrays: [MLXArray]?
+        for try await event in await session.generateStream(imageData: imageData, image: inputArray, parameters: params) {
+          switch event {
+          case .progress(let info):
+            Task { @MainActor [weak self] in
+              self?.generationState = .generating(
+                step: info.step + 1,
+                total: info.total,
+                progress: info.fractionCompleted
+              )
+            }
+          case .output(let outputLayers):
+            layerArrays = outputLayers
           }
         }
+
+        guard let layerArrays else {
+          throw LayeredGenerationError.generationDidNotProduceOutput
+        }
+
         logger.info("Task \(taskId): Generation complete, got \(layerArrays.count) layers")
 
         if Task.isCancelled {
@@ -295,6 +317,7 @@ final class LayeredViewModel {
 enum LayeredGenerationError: LocalizedError {
   case invalidInput(String)
   case noLayersToExport
+  case generationDidNotProduceOutput
 
   var errorDescription: String? {
     switch self {
@@ -302,6 +325,8 @@ enum LayeredGenerationError: LocalizedError {
       return "Invalid input: \(message)"
     case .noLayersToExport:
       return "No layers to export. Generate layers first."
+    case .generationDidNotProduceOutput:
+      return "Generation did not produce any layers."
     }
   }
 }

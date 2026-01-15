@@ -213,6 +213,14 @@ enum ImageIOService {
     try data.write(to: url)
   }
 
+  static func pngData(from cgImage: CGImage) throws -> Data {
+    let bitmap = NSBitmapImageRep(cgImage: cgImage)
+    guard let data = bitmap.representation(using: .png, properties: [:]) else {
+      throw ImageIOError.conversionFailed("Failed to encode CGImage as PNG")
+    }
+    return data
+  }
+
   static func exportLayers(
     _ images: [NSImage],
     to directory: URL,

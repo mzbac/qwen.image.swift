@@ -37,7 +37,7 @@ public enum QwenModelRepository {
     offline: Bool = false,
     useBackgroundSession: Bool = false,
     additionalPatterns: [String] = []
-  ) -> HubSnapshotOptions {
+  ) throws -> HubSnapshotOptions {
     var patterns = defaultPatterns
     if !additionalPatterns.isEmpty {
       patterns.append(contentsOf: additionalPatterns)

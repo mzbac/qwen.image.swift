@@ -3,6 +3,177 @@ import QwenImage
 import MLX
 import Logging
 
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+
+private actor ImagePipelineExecutor {
+  private let pipeline: QwenImagePipeline
+
+  init(pipeline: QwenImagePipeline) {
+    self.pipeline = pipeline
+  }
+
+  func generatePixels(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    guidanceEncoding: QwenGuidanceEncoding,
+    seed: UInt64? = nil,
+    eventEmitter: AsyncThrowingStreamEmitter<QwenGenerationEvent>? = nil
+  ) async throws -> MLXArray {
+    if let eventEmitter {
+      return try await pipeline.generatePixels(
+        parameters: parameters,
+        model: model,
+        guidanceEncoding: guidanceEncoding,
+        seed: seed,
+        progress: { info in eventEmitter.yield(.progress(info)) }
+      )
+    }
+
+    return try await pipeline.generatePixels(
+      parameters: parameters,
+      model: model,
+      guidanceEncoding: guidanceEncoding,
+      seed: seed
+    )
+  }
+
+#if canImport(CoreGraphics)
+  func generateEditedPixels(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImage: CGImage,
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil,
+    eventEmitter: AsyncThrowingStreamEmitter<QwenGenerationEvent>? = nil
+  ) async throws -> MLXArray {
+    if let eventEmitter {
+      return try await pipeline.generateEditedPixels(
+        parameters: parameters,
+        model: model,
+        referenceImage: referenceImage,
+        maxPromptLength: maxPromptLength,
+        seed: seed,
+        progress: { info in eventEmitter.yield(.progress(info)) }
+      )
+    }
+
+    return try await pipeline.generateEditedPixels(
+      parameters: parameters,
+      model: model,
+      referenceImage: referenceImage,
+      maxPromptLength: maxPromptLength,
+      seed: seed
+    )
+  }
+
+  func generateEditedPixels(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImages: [CGImage],
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil,
+    eventEmitter: AsyncThrowingStreamEmitter<QwenGenerationEvent>? = nil
+  ) async throws -> MLXArray {
+    if let eventEmitter {
+      return try await pipeline.generateEditedPixels(
+        parameters: parameters,
+        model: model,
+        referenceImages: referenceImages,
+        maxPromptLength: maxPromptLength,
+        seed: seed,
+        progress: { info in eventEmitter.yield(.progress(info)) }
+      )
+    }
+
+    return try await pipeline.generateEditedPixels(
+      parameters: parameters,
+      model: model,
+      referenceImages: referenceImages,
+      maxPromptLength: maxPromptLength,
+      seed: seed
+    )
+  }
+
+  func makeImage(from pixels: MLXArray) throws -> PipelineImage {
+    try pipeline.makeImage(from: pixels)
+  }
+#endif
+
+  func encodeGuidancePrompts(
+    prompt: String,
+    negativePrompt: String?,
+    maxLength: Int
+  ) throws -> QwenGuidanceEncoding {
+    try pipeline.encodeGuidancePrompts(
+      prompt: prompt,
+      negativePrompt: negativePrompt,
+      maxLength: maxLength
+    )
+  }
+
+  func loadModelDescriptor() throws -> QwenModelDescriptor {
+    try pipeline.loadModelDescriptor()
+  }
+
+  func resolvedDType() throws -> DType {
+    try pipeline.resolvedDType()
+  }
+
+  func promptEncodingQuantizationId() -> String {
+    pipeline.promptEncodingQuantizationId()
+  }
+
+  func setPendingLora(from url: URL, scale: Float) {
+    pipeline.setPendingLora(from: url, scale: scale)
+  }
+
+  func applyLora(from url: URL, scale: Float) throws {
+    try pipeline.applyLora(from: url, scale: scale)
+  }
+
+  func releaseEncoders() {
+    pipeline.releaseEncoders()
+  }
+
+  func releaseTextEncoder() {
+    pipeline.releaseTextEncoder()
+  }
+
+  func releaseVisionTower() {
+    pipeline.releaseVisionTower()
+  }
+
+  func reloadTextEncoder() throws {
+    try pipeline.reloadTextEncoder()
+  }
+
+  func reloadTokenizer() throws {
+    try pipeline.reloadTokenizer()
+  }
+
+  func isTextEncoderLoaded() -> Bool {
+    pipeline.isTextEncoderLoaded
+  }
+
+  func isTokenizerLoaded() -> Bool {
+    pipeline.isTokenizerLoaded
+  }
+
+  func isVisionTowerLoaded() -> Bool {
+    pipeline.isVisionTowerLoaded
+  }
+
+  func isUNetLoaded() -> Bool {
+    pipeline.isUNetLoaded
+  }
+
+  func isVAELoaded() -> Bool {
+    pipeline.isVAELoaded
+  }
+}
+
 // MARK: - Session Configuration
 
 /// Configuration for ImagePipelineSession resource management policies.
@@ -75,12 +246,13 @@ public struct ImagePipelineSessionConfiguration: Sendable {
 /// let pixels = try await session.generate(parameters: params, model: modelConfig)
 /// ```
 public actor ImagePipelineSession {
-  private let pipeline: QwenImagePipeline
+  private let pipelineExecutor: ImagePipelineExecutor
   private let embeddingsCache: PromptEmbeddingsCache
   private let modelId: String
   private let revision: String
   private let configuration: ImagePipelineSessionConfiguration
   private var logger = Logger(label: "qwen.image.session")
+  private var appliedLora: (url: URL, scale: Float)?
 
   /// Create a new session wrapping a pipeline.
   /// - Parameters:
@@ -94,7 +266,7 @@ public actor ImagePipelineSession {
     revision: String = "main",
     configuration: ImagePipelineSessionConfiguration = .default
   ) {
-    self.pipeline = pipeline
+    self.pipelineExecutor = ImagePipelineExecutor(pipeline: pipeline)
     self.modelId = modelId
     self.revision = revision
     self.configuration = configuration
@@ -140,18 +312,172 @@ public actor ImagePipelineSession {
 
     // Release encoders if configured to do so
     if configuration.releaseEncodersAfterEncoding {
-      pipeline.releaseEncoders()
+      await pipelineExecutor.releaseEncoders()
       logger.debug("Released encoders after encoding")
     }
 
     // Generate using the policy-free overload
-    return try pipeline.generatePixels(
+    return try await pipelineExecutor.generatePixels(
       parameters: parameters,
       model: model,
       guidanceEncoding: encoding,
       seed: seed
     )
   }
+
+  public func loadModelDescriptor() async throws -> QwenModelDescriptor {
+    try await pipelineExecutor.loadModelDescriptor()
+  }
+
+#if canImport(CoreGraphics)
+  public func makeImage(from pixels: MLXArray) async throws -> PipelineImage {
+    try await pipelineExecutor.makeImage(from: pixels)
+  }
+#endif
+
+  public func generateStream(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil
+  ) -> AsyncThrowingStream<QwenGenerationEvent, Error> {
+    AsyncThrowingStream { continuation in
+      let emitter = AsyncThrowingStreamEmitter<QwenGenerationEvent>(continuation)
+      let task = Task {
+        do {
+          let maxLength = maxPromptLength ?? model.maxSequenceLength
+          let encoding = try await guidanceEncoding(
+            prompt: parameters.prompt,
+            negativePrompt: parameters.negativePrompt,
+            maxLength: maxLength
+          )
+
+          if configuration.releaseEncodersAfterEncoding {
+            await pipelineExecutor.releaseEncoders()
+          }
+
+          let pixels = try await pipelineExecutor.generatePixels(
+            parameters: parameters,
+            model: model,
+            guidanceEncoding: encoding,
+            seed: seed,
+            eventEmitter: emitter
+          )
+          emitter.yield(.output(pixels))
+          emitter.finish()
+        } catch {
+          emitter.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+        emitter.finish()
+      }
+    }
+  }
+
+#if canImport(CoreGraphics)
+  public func generateEditedPixels(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImage: CGImage,
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil
+  ) async throws -> MLXArray {
+    try await pipelineExecutor.generateEditedPixels(
+      parameters: parameters,
+      model: model,
+      referenceImage: referenceImage,
+      maxPromptLength: maxPromptLength,
+      seed: seed,
+      eventEmitter: nil
+    )
+  }
+
+  public func generateEditedPixels(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImages: [CGImage],
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil
+  ) async throws -> MLXArray {
+    try await pipelineExecutor.generateEditedPixels(
+      parameters: parameters,
+      model: model,
+      referenceImages: referenceImages,
+      maxPromptLength: maxPromptLength,
+      seed: seed,
+      eventEmitter: nil
+    )
+  }
+
+  public func generateEditedPixelsStream(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImage: CGImage,
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil
+  ) -> AsyncThrowingStream<QwenGenerationEvent, Error> {
+    AsyncThrowingStream { continuation in
+      let emitter = AsyncThrowingStreamEmitter<QwenGenerationEvent>(continuation)
+      let task = Task {
+        do {
+          let pixels = try await pipelineExecutor.generateEditedPixels(
+            parameters: parameters,
+            model: model,
+            referenceImage: referenceImage,
+            maxPromptLength: maxPromptLength,
+            seed: seed,
+            eventEmitter: emitter
+          )
+          emitter.yield(.output(pixels))
+          emitter.finish()
+        } catch {
+          emitter.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+        emitter.finish()
+      }
+    }
+  }
+
+  public func generateEditedPixelsStream(
+    parameters: GenerationParameters,
+    model: QwenModelConfiguration,
+    referenceImages: [CGImage],
+    maxPromptLength: Int? = nil,
+    seed: UInt64? = nil
+  ) -> AsyncThrowingStream<QwenGenerationEvent, Error> {
+    AsyncThrowingStream { continuation in
+      let emitter = AsyncThrowingStreamEmitter<QwenGenerationEvent>(continuation)
+      let task = Task {
+        do {
+          let pixels = try await pipelineExecutor.generateEditedPixels(
+            parameters: parameters,
+            model: model,
+            referenceImages: referenceImages,
+            maxPromptLength: maxPromptLength,
+            seed: seed,
+            eventEmitter: emitter
+          )
+          emitter.yield(.output(pixels))
+          emitter.finish()
+        } catch {
+          emitter.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+        emitter.finish()
+      }
+    }
+  }
+#endif
 
   // MARK: - Encoding
 
@@ -167,9 +493,16 @@ public actor ImagePipelineSession {
     negativePrompt: String?,
     maxLength: Int
   ) async throws -> QwenGuidanceEncoding {
+    let descriptor = try await pipelineExecutor.loadModelDescriptor()
+    let dtype = try await pipelineExecutor.resolvedDType()
+    let quantizationId = await pipelineExecutor.promptEncodingQuantizationId()
+
     let cacheKey = PromptEmbeddingsCacheKey(
       modelId: modelId,
       revision: revision,
+      modelDescriptorId: descriptor.identity,
+      quantizationId: quantizationId,
+      dtype: dtype.stableName,
       maxLength: maxLength,
       prompt: prompt,
       negativePrompt: negativePrompt
@@ -183,10 +516,10 @@ public actor ImagePipelineSession {
 
     logger.debug("Cache miss, encoding prompt")
 
-    try pipeline.reloadTokenizer()
-    try pipeline.reloadTextEncoder()
+    try await pipelineExecutor.reloadTokenizer()
+    try await pipelineExecutor.reloadTextEncoder()
 
-    let encoding = try pipeline.encodeGuidancePrompts(
+    let encoding = try await pipelineExecutor.encodeGuidancePrompts(
       prompt: prompt,
       negativePrompt: negativePrompt,
       maxLength: maxLength
@@ -199,29 +532,52 @@ public actor ImagePipelineSession {
   // MARK: - Lifecycle Management
 
   /// Explicitly release encoder components to free memory.
-  public func releaseEncoders() {
-    pipeline.releaseEncoders()
+  public func releaseEncoders() async {
+    await pipelineExecutor.releaseEncoders()
     logger.debug("Encoders released explicitly")
   }
 
   /// Release only the text encoder.
-  public func releaseTextEncoder() {
-    pipeline.releaseTextEncoder()
+  public func releaseTextEncoder() async {
+    await pipelineExecutor.releaseTextEncoder()
   }
 
   /// Release only the vision tower.
-  public func releaseVisionTower() {
-    pipeline.releaseVisionTower()
+  public func releaseVisionTower() async {
+    await pipelineExecutor.releaseVisionTower()
   }
 
   /// Reload the text encoder (if weights directory is set).
-  public func reloadTextEncoder() throws {
-    try pipeline.reloadTextEncoder()
+  public func reloadTextEncoder() async throws {
+    try await pipelineExecutor.reloadTextEncoder()
   }
 
   /// Reload the tokenizer (if weights directory is set).
-  public func reloadTokenizer() throws {
-    try pipeline.reloadTokenizer()
+  public func reloadTokenizer() async throws {
+    try await pipelineExecutor.reloadTokenizer()
+  }
+
+  // MARK: - LoRA
+
+  public func applyLora(from url: URL, scale: Float = 1.0) async throws {
+    if let applied = appliedLora {
+      guard applied.url == url, applied.scale == scale else {
+        throw QwenImageRuntimeError.loraAlreadyApplied(
+          appliedURL: applied.url,
+          appliedScale: applied.scale,
+          requestedURL: url,
+          requestedScale: scale
+        )
+      }
+      return
+    }
+
+    if await pipelineExecutor.isUNetLoaded() {
+      try await pipelineExecutor.applyLora(from: url, scale: scale)
+    } else {
+      await pipelineExecutor.setPendingLora(from: url, scale: scale)
+    }
+    appliedLora = (url: url, scale: scale)
   }
 
   // MARK: - Cache Management
@@ -248,43 +604,63 @@ public actor ImagePipelineSession {
 
   /// Check if the text encoder is currently loaded.
   public var isTextEncoderLoaded: Bool {
-    pipeline.isTextEncoderLoaded
+    get async {
+      await pipelineExecutor.isTextEncoderLoaded()
+    }
   }
 
   /// Check if the tokenizer is currently loaded.
   public var isTokenizerLoaded: Bool {
-    pipeline.isTokenizerLoaded
+    get async {
+      await pipelineExecutor.isTokenizerLoaded()
+    }
   }
 
   /// Check if the vision tower is currently loaded.
   public var isVisionTowerLoaded: Bool {
-    pipeline.isVisionTowerLoaded
+    get async {
+      await pipelineExecutor.isVisionTowerLoaded()
+    }
   }
 
   /// Check if the UNet is currently loaded.
   public var isUNetLoaded: Bool {
-    pipeline.isUNetLoaded
+    get async {
+      await pipelineExecutor.isUNetLoaded()
+    }
   }
 
   /// Check if the VAE is currently loaded.
   public var isVAELoaded: Bool {
-    pipeline.isVAELoaded
+    get async {
+      await pipelineExecutor.isVAELoaded()
+    }
   }
 }
 
 // MARK: - Sync Wrapper
 
 extension ImagePipelineSession {
-  /// Synchronous wrapper for cache lookup (non-isolated).
-  /// Use this when you need to check the cache without async context.
-  nonisolated public func hasCachedEncoding(
+  /// Convenience wrapper for cache lookup.
+  public func hasCachedEncoding(
     prompt: String,
     negativePrompt: String?,
     maxLength: Int
   ) async -> Bool {
+    guard let descriptor = try? await pipelineExecutor.loadModelDescriptor() else {
+      return false
+    }
+    guard let dtype = try? await pipelineExecutor.resolvedDType() else {
+      return false
+    }
+    let quantizationId = await pipelineExecutor.promptEncodingQuantizationId()
+
     let cacheKey = PromptEmbeddingsCacheKey(
       modelId: modelId,
       revision: revision,
+      modelDescriptorId: descriptor.identity,
+      quantizationId: quantizationId,
+      dtype: dtype.stableName,
       maxLength: maxLength,
       prompt: prompt,
       negativePrompt: negativePrompt

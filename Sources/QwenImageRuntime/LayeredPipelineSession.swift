@@ -3,6 +3,80 @@ import QwenImage
 import MLX
 import Logging
 
+private actor LayeredPipelineExecutor {
+  private let pipeline: QwenLayeredPipeline
+
+  init(pipeline: QwenLayeredPipeline) {
+    self.pipeline = pipeline
+  }
+
+  func encodePromptToEncoding(_ prompt: String, dtype: DType) throws -> LayeredPromptEncoding {
+    try pipeline.encodePromptToEncoding(prompt, dtype: dtype)
+  }
+
+  func generate(
+    image: MLXArray,
+    parameters: LayeredGenerationParameters,
+    promptEncoding: LayeredPromptEncoding,
+    negativePromptEncoding: LayeredPromptEncoding?,
+    progress: ((Int, Int, Float) -> Void)?
+  ) async throws -> [MLXArray] {
+    try await pipeline.generate(
+      image: image,
+      parameters: parameters,
+      promptEncoding: promptEncoding,
+      negativePromptEncoding: negativePromptEncoding,
+      progress: progress
+    )
+  }
+
+  func generate(
+    image: MLXArray,
+    parameters: LayeredGenerationParameters,
+    promptEncoding: LayeredPromptEncoding,
+    negativePromptEncoding: LayeredPromptEncoding?,
+    eventEmitter: AsyncThrowingStreamEmitter<QwenLayeredGenerationEvent>
+  ) async throws -> [MLXArray] {
+    try await pipeline.generate(
+      image: image,
+      parameters: parameters,
+      promptEncoding: promptEncoding,
+      negativePromptEncoding: negativePromptEncoding,
+      progress: { step, total, fraction in
+        eventEmitter.yield(.progress(QwenLayeredProgressInfo(step: step, total: total, fractionCompleted: fraction)))
+      }
+    )
+  }
+
+  func applyLora(from url: URL, scale: Float) throws {
+    try pipeline.applyLora(from: url, scale: scale)
+  }
+
+  func releaseTextEncoder() {
+    pipeline.releaseTextEncoder()
+  }
+
+  func releaseTokenizer() {
+    pipeline.releaseTokenizer()
+  }
+
+  func reloadTextEncoder() throws {
+    try pipeline.reloadTextEncoder()
+  }
+
+  func reloadTokenizer() throws {
+    try pipeline.reloadTokenizer()
+  }
+
+  func isTextEncoderLoaded() -> Bool {
+    pipeline.isTextEncoderLoaded
+  }
+
+  func isTokenizerLoaded() -> Bool {
+    pipeline.isTokenizerLoaded
+  }
+}
+
 // MARK: - Session Configuration
 
 /// Configuration for LayeredPipelineSession resource management policies.
@@ -90,12 +164,13 @@ public struct LayeredPipelineSessionConfiguration: Sendable {
 /// )
 /// ```
 public actor LayeredPipelineSession {
-  private let pipeline: QwenLayeredPipeline
+  private let pipelineExecutor: LayeredPipelineExecutor
   private let captionCache: LayeredCaptionCache
   private let modelId: String
   private let revision: String
   private let configuration: LayeredPipelineSessionConfiguration
   private var logger = Logger(label: "qwen.layered.session")
+  private var appliedLora: (url: URL, scale: Float)?
 
   /// Create a new session wrapping a pipeline.
   /// - Parameters:
@@ -109,7 +184,7 @@ public actor LayeredPipelineSession {
     revision: String = "main",
     configuration: LayeredPipelineSessionConfiguration = .default
   ) {
-    self.pipeline = pipeline
+    self.pipelineExecutor = LayeredPipelineExecutor(pipeline: pipeline)
     self.modelId = modelId
     self.revision = revision
     self.configuration = configuration
@@ -171,18 +246,73 @@ public actor LayeredPipelineSession {
 
     // Release text encoder if configured
     if configuration.releaseTextEncoderAfterEncoding {
-      pipeline.releaseTextEncoder()
+      await pipelineExecutor.releaseTextEncoder()
       logger.debug("Released text encoder after encoding")
     }
 
     // Generate using the policy-free overload
-    return try pipeline.generate(
+    return try await pipelineExecutor.generate(
       image: image,
       parameters: parameters,
       promptEncoding: promptEncoding,
       negativePromptEncoding: negativeEncoding,
       progress: progress
     )
+  }
+
+  public func generateStream(
+    imageData: Data,
+    image: MLXArray,
+    parameters: LayeredGenerationParameters
+  ) -> AsyncThrowingStream<QwenLayeredGenerationEvent, Error> {
+    AsyncThrowingStream { continuation in
+      let emitter = AsyncThrowingStreamEmitter<QwenLayeredGenerationEvent>(continuation)
+      let task = Task {
+        do {
+          let imageHash = configuration.useFastImageHash
+            ? ImageHashUtility.fastHash(from: imageData)
+            : ImageHashUtility.sha256Hash(from: imageData)
+
+          let promptText = parameters.prompt ?? ""
+
+          let cacheKey = LayeredCaptionCacheKey(
+            modelId: modelId,
+            revision: revision,
+            prompt: promptText,
+            negativePrompt: parameters.negativePrompt,
+            imageHash: imageHash
+          )
+
+          let (promptEncoding, negativeEncoding) = try await getOrComputeEncodings(
+            cacheKey: cacheKey,
+            prompt: promptText,
+            negativePrompt: parameters.negativePrompt,
+            dtype: image.dtype
+          )
+
+          if configuration.releaseTextEncoderAfterEncoding {
+            await pipelineExecutor.releaseTextEncoder()
+          }
+
+          let layers = try await pipelineExecutor.generate(
+            image: image,
+            parameters: parameters,
+            promptEncoding: promptEncoding,
+            negativePromptEncoding: negativeEncoding,
+            eventEmitter: emitter
+          )
+          emitter.yield(.output(layers))
+          emitter.finish()
+        } catch {
+          emitter.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+        emitter.finish()
+      }
+    }
   }
 
   /// Generate layer images from an image file URL.
@@ -215,6 +345,35 @@ public actor LayeredPipelineSession {
     )
   }
 
+  public func generateStream(
+    imageURL: URL,
+    parameters: LayeredGenerationParameters,
+    imageConverter: @escaping (Data) throws -> MLXArray
+  ) -> AsyncThrowingStream<QwenLayeredGenerationEvent, Error> {
+    AsyncThrowingStream { continuation in
+      let emitter = AsyncThrowingStreamEmitter<QwenLayeredGenerationEvent>(continuation)
+      let task = Task {
+        do {
+          guard let imageData = ImageHashUtility.loadImageData(from: imageURL) else {
+            throw LayeredPipelineError.invalidImageShape
+          }
+          let imageArray = try imageConverter(imageData)
+          for try await event in generateStream(imageData: imageData, image: imageArray, parameters: parameters) {
+            emitter.yield(event)
+          }
+          emitter.finish()
+        } catch {
+          emitter.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+        emitter.finish()
+      }
+    }
+  }
+
   // MARK: - Encoding
 
   /// Get or compute caption encodings with caching.
@@ -233,12 +392,12 @@ public actor LayeredPipelineSession {
     logger.debug("Cache miss, encoding caption")
 
     // Encode prompt
-    let promptEncoding = try pipeline.encodePromptToEncoding(prompt, dtype: dtype)
+    let promptEncoding = try await pipelineExecutor.encodePromptToEncoding(prompt, dtype: dtype)
 
     // Encode negative prompt if provided
     var negativeEncoding: LayeredPromptEncoding? = nil
     if let negPrompt = negativePrompt {
-      negativeEncoding = try pipeline.encodePromptToEncoding(negPrompt, dtype: dtype)
+      negativeEncoding = try await pipelineExecutor.encodePromptToEncoding(negPrompt, dtype: dtype)
     }
 
     // Cache the encodings
@@ -253,31 +412,31 @@ public actor LayeredPipelineSession {
 
   /// Encode a prompt without caching.
   /// Use this for one-off encodings or when you want to manage caching externally.
-  public func encodePrompt(_ prompt: String, dtype: DType) throws -> LayeredPromptEncoding {
-    try pipeline.encodePromptToEncoding(prompt, dtype: dtype)
+  public func encodePrompt(_ prompt: String, dtype: DType) async throws -> LayeredPromptEncoding {
+    try await pipelineExecutor.encodePromptToEncoding(prompt, dtype: dtype)
   }
 
   // MARK: - Lifecycle Management
 
   /// Release the text encoder to free memory.
-  public func releaseTextEncoder() {
-    pipeline.releaseTextEncoder()
+  public func releaseTextEncoder() async {
+    await pipelineExecutor.releaseTextEncoder()
     logger.debug("Text encoder released explicitly")
   }
 
   /// Release the tokenizer to free memory.
-  public func releaseTokenizer() {
-    pipeline.releaseTokenizer()
+  public func releaseTokenizer() async {
+    await pipelineExecutor.releaseTokenizer()
   }
 
   /// Reload the text encoder (if weights directory is set).
-  public func reloadTextEncoder() throws {
-    try pipeline.reloadTextEncoder()
+  public func reloadTextEncoder() async throws {
+    try await pipelineExecutor.reloadTextEncoder()
   }
 
   /// Reload the tokenizer (if weights directory is set).
-  public func reloadTokenizer() throws {
-    try pipeline.reloadTokenizer()
+  public func reloadTokenizer() async throws {
+    try await pipelineExecutor.reloadTokenizer()
   }
 
   // MARK: - Cache Management
@@ -313,12 +472,16 @@ public actor LayeredPipelineSession {
 
   /// Check if the text encoder is currently loaded.
   public var isTextEncoderLoaded: Bool {
-    pipeline.isTextEncoderLoaded
+    get async {
+      await pipelineExecutor.isTextEncoderLoaded()
+    }
   }
 
   /// Check if the tokenizer is currently loaded.
   public var isTokenizerLoaded: Bool {
-    pipeline.isTokenizerLoaded
+    get async {
+      await pipelineExecutor.isTokenizerLoaded()
+    }
   }
 
   // MARK: - LoRA
@@ -328,9 +491,22 @@ public actor LayeredPipelineSession {
   ///   - url: URL to the LoRA safetensors file.
   ///   - scale: LoRA scale factor.
   public func applyLora(from url: URL, scale: Float = 1.0) async throws {
-    try pipeline.applyLora(from: url, scale: scale)
+    if let appliedLora {
+      guard appliedLora.url == url, appliedLora.scale == scale else {
+        throw QwenImageRuntimeError.loraAlreadyApplied(
+          appliedURL: appliedLora.url,
+          appliedScale: appliedLora.scale,
+          requestedURL: url,
+          requestedScale: scale
+        )
+      }
+      return
+    }
+
+    try await pipelineExecutor.applyLora(from: url, scale: scale)
     // Invalidate cache since model weights changed
     await captionCache.invalidateAll()
+    appliedLora = (url: url, scale: scale)
     logger.info("Applied LoRA and invalidated cache")
   }
 }

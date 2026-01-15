@@ -19,7 +19,8 @@ public struct SwiftQuantSaver {
     to outputRoot: URL,
     components: [String],
     spec: QwenQuantizationSpec,
-    allowedLayerMap: [String: Set<String>]? = nil
+    allowedLayerMap: [String: Set<String>]? = nil,
+    progress: ((String) -> Void)? = nil
   ) throws {
     try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
 
@@ -38,6 +39,7 @@ public struct SwiftQuantSaver {
           baseFileName: "diffusion_pytorch_model.safetensors",
           spec: spec,
           allowedLayerMap: allowedLayerMap,
+          progress: progress,
           record: &layers
         )
         _ = fileName
@@ -53,6 +55,7 @@ public struct SwiftQuantSaver {
           baseFileName: "model.safetensors",
           spec: spec,
           allowedLayerMap: allowedLayerMap,
+          progress: progress,
           record: &layers
         )
         _ = fileName
@@ -108,77 +111,49 @@ public struct SwiftQuantSaver {
     baseFileName: String,
     spec: QwenQuantizationSpec,
     allowedLayerMap: [String: Set<String>]?,
+    progress: ((String) -> Void)?,
     record layers: inout [(component: String, name: String, shape: [Int], inDim: Int, outDim: Int, file: String)]
   ) throws -> String {
     let shardURLs = try collectSafetensors(in: inputDirectory)
-    let readers = try shardURLs.map { try SafeTensorsReader(fileURL: $0) }
-    var merged = try WeightsMapping.merge(readers: readers, dtype: nil)
 
     let supportedGroupSizes: Set<Int> = [32, 64, 128]
     let group = spec.groupSize
     guard supportedGroupSizes.contains(group) else { return baseFileName }
 
-    var quantizedBases = Set<String>()
-    for (key, tensor) in merged {
-      guard key.hasSuffix(".weight") else { continue }
-      guard tensor.ndim == 2 else { continue }
-      let outDim = tensor.dim(0)
-      let inDim = tensor.dim(1)
-      let base = String(key.dropLast(".weight".count))
-      guard isAllowed(base: base, allowedLayerMap: allowedLayerMap, component: componentName) else { continue }
-      guard inDim % group == 0 else { continue }
-      var f = tensor
-      if f.dtype != .float32 && f.dtype != .bfloat16 && f.dtype != .float16 { continue }
-      f = f.asType(.float32)
-      let (wq, scales, biases) = MLX.quantized(f, groupSize: group, bits: spec.bits, mode: spec.mode)
-      merged[key] = wq
-      merged["\(base).scales"] = scales
-      if let b = biases { merged["\(base).biases"] = b }
-      quantizedBases.insert(base)
-      layers.append((componentName, base, [outDim, inDim], inDim, outDim, ""))
-    }
+    for shardURL in shardURLs {
+      let reader = try SafeTensorsReader(fileURL: shardURL)
+      var tensors = try reader.loadAllTensors(as: nil)
+      let shardFileName = shardURL.lastPathComponent
+      progress?("Quantizing \(componentName): \(shardFileName)")
 
-    func bytes(of array: MLXArray) -> Int {
-      let count = array.shape.reduce(1, *)
-      return count * array.dtype.size
-    }
-    let maxShardBytes = 4_500_000_000 // < 5 GB including metadata
-    let ordered = merged.keys.sorted().map { ($0, merged[$0]!) }
-    var chunks: [[(String, MLXArray)]] = []
-    var current: [(String, MLXArray)] = []
-    var currentBytes = 0
-    for (k, v) in ordered {
-      let sz = bytes(of: v)
-      if currentBytes > 0 && currentBytes + sz > maxShardBytes {
-        chunks.append(current)
-        current = []
-        currentBytes = 0
+      // Quantize weights in this shard only (keeps peak memory bounded to a single safetensors file).
+      let keys = tensors.keys.sorted()
+      for key in keys {
+        guard let tensor = tensors[key] else { continue }
+        guard key.hasSuffix(".weight") else { continue }
+        guard tensor.ndim == 2 else { continue }
+        let outDim = tensor.dim(0)
+        let inDim = tensor.dim(1)
+        let base = String(key.dropLast(".weight".count))
+        guard isAllowed(base: base, allowedLayerMap: allowedLayerMap, component: componentName) else { continue }
+        guard inDim % group == 0 else { continue }
+        guard tensor.dtype == .float32 || tensor.dtype == .bfloat16 || tensor.dtype == .float16 else { continue }
+
+        let f = tensor.asType(.float32)
+        let (wq, scales, biases) = MLX.quantized(f, groupSize: group, bits: spec.bits, mode: spec.mode)
+        tensors[key] = wq
+        tensors["\(base).scales"] = scales
+        if let b = biases { tensors["\(base).biases"] = b }
+        layers.append((componentName, base, [outDim, inDim], inDim, outDim, shardFileName))
       }
-      current.append((k, v))
-      currentBytes += sz
-    }
-    if !current.isEmpty { chunks.append(current) }
 
-    let total = max(1, chunks.count)
-    let stem = String(baseFileName.split(separator: ".").first ?? Substring(baseFileName))
-    for (i, chunk) in chunks.enumerated() {
-      let shardName = String(format: "%@-%05d-of-%05d.safetensors", stem, i + 1, total)
-      let dst = outputDirectory.appending(path: shardName)
-      var dict: [String: MLXArray] = [:]
-      for (k, v) in chunk { dict[k] = v }
-      try MLX.save(arrays: dict, metadata: [:], url: dst)
-    }
+      let dst = outputDirectory.appending(path: shardFileName)
+      try? FileManager.default.removeItem(at: dst)
+      try MLX.save(arrays: tensors, metadata: reader.fileMetadata, url: dst)
 
-    var fileMap: [String: String] = [:]
-    for (i, chunk) in chunks.enumerated() {
-      let shardName = String(format: "%@-%05d-of-%05d.safetensors", stem, i + 1, total)
-      let keys = Set(chunk.map { $0.0 })
-      for base in quantizedBases where keys.contains("\(base).weight") { fileMap[base] = shardName }
-    }
-    for idx in 0..<layers.count {
-      if layers[idx].component == componentName, let fname = fileMap[layers[idx].name] {
-        layers[idx].file = fname
-      }
+      // Avoid cache retention across shards when running on unified memory.
+      GPU.clearCache()
+      progress?("Saved \(componentName): \(shardFileName)")
     }
     return baseFileName
   }

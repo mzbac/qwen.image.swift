@@ -93,8 +93,14 @@ public struct QwenQuantizationPlan {
     return merged
   }
 
-  public mutating func registerPrepackedLayers(from manifest: QwenQuantizedSnapshotManifest) {
+  public mutating func registerPrepackedLayers(
+    from manifest: QwenQuantizedSnapshotManifest,
+    component: String? = nil
+  ) {
     for layer in manifest.layers {
+      if let component, let layerComponent = layer.component, layerComponent != component {
+        continue
+      }
       let spec = layer.spec ?? manifest.defaultSpec
       perLayer[layer.name] = .quantize(spec)
       prepackedLayers[layer.name] = QwenPrepackedLayer(spec: spec, quantizedFile: layer.quantFile ?? layer.file)
@@ -202,6 +208,7 @@ private extension QuantizationMode {
 
 public struct QwenQuantizedSnapshotManifest: Decodable {
   public struct Layer: Decodable {
+    public let component: String?
     public let name: String
     public let file: String?
     public let shape: [Int]?
@@ -213,6 +220,7 @@ public struct QwenQuantizedSnapshotManifest: Decodable {
     public let mode: QuantizationMode?
 
     enum CodingKeys: String, CodingKey {
+      case component
       case name
       case file
       case shape
@@ -226,6 +234,7 @@ public struct QwenQuantizedSnapshotManifest: Decodable {
 
     public init(from decoder: any Decoder) throws {
       let container = try decoder.container(keyedBy: CodingKeys.self)
+      component = try container.decodeIfPresent(String.self, forKey: .component)
       name = try container.decode(String.self, forKey: .name)
       file = try container.decodeIfPresent(String.self, forKey: .file)
       shape = try container.decodeIfPresent([Int].self, forKey: .shape)

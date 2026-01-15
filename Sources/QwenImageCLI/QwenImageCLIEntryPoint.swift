@@ -9,7 +9,74 @@ import QwenImage
 import QwenImageRuntime
 import Metal
 
-struct FileLogHandler: LogHandler {
+private struct CLIProfiler {
+  private let startTime: DispatchTime
+  private var lastTime: DispatchTime
+  private var lastRSSBytes: UInt64?
+
+  init() {
+    let now = DispatchTime.now()
+    startTime = now
+    lastTime = now
+    lastRSSBytes = Self.currentResidentBytes()
+  }
+
+  mutating func mark(_ label: String, logger: Logger) {
+    let now = DispatchTime.now()
+    let rssBytes = Self.currentResidentBytes()
+    let elapsed = Self.elapsedSeconds(from: lastTime, to: now)
+    let total = Self.elapsedSeconds(from: startTime, to: now)
+
+    var message = "[profile] \(label) (+\(Self.formatSeconds(elapsed))s, total \(Self.formatSeconds(total))s"
+
+    if let rssBytes {
+      message += ", rss \(Self.formatBytes(rssBytes))"
+    }
+
+    if let rssBytes, let lastRSSBytes {
+      let delta = Int64(rssBytes) - Int64(lastRSSBytes)
+      if delta != 0 {
+        let sign = delta > 0 ? "+" : ""
+        message += ", Δrss \(sign)\(Self.formatBytes(UInt64(abs(delta))))"
+      }
+    }
+
+    message += ")"
+    logger.info("\(message)")
+
+    lastTime = now
+    lastRSSBytes = rssBytes
+  }
+
+  private static func elapsedSeconds(from start: DispatchTime, to end: DispatchTime) -> Double {
+    let delta = end.uptimeNanoseconds &- start.uptimeNanoseconds
+    return Double(delta) / 1_000_000_000.0
+  }
+
+  private static func formatSeconds(_ value: Double) -> String {
+    String(format: "%.2f", value)
+  }
+
+  private static func formatBytes(_ bytes: UInt64) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+  }
+
+  private static func currentResidentBytes() -> UInt64? {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.stride / MemoryLayout<integer_t>.stride)
+    let kerr = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+        task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), rebound, &count)
+      }
+    }
+    guard kerr == KERN_SUCCESS else {
+      return nil
+    }
+    return UInt64(info.resident_size)
+  }
+}
+
+private struct FileLogHandler: LogHandler {
   let label: String
   var metadata: Logger.Metadata = [:]
   var logLevel: Logger.Level
@@ -59,20 +126,24 @@ struct FileLogHandler: LogHandler {
   }
 }
 
-LoggingSystem.bootstrap { label in
-  let env = ProcessInfo.processInfo.environment
-  let levelString = env["QWEN_IMAGE_LOG_LEVEL"]?.lowercased() ?? "info"
-  let level = Logger.Level(rawValue: levelString) ?? .info
+private enum QwenImageCLILogging {
+  static func bootstrap() {
+    LoggingSystem.bootstrap { label in
+      let env = ProcessInfo.processInfo.environment
+      let levelString = env["QWEN_IMAGE_LOG_LEVEL"]?.lowercased() ?? "info"
+      let level = Logger.Level(rawValue: levelString) ?? .info
 
-  var stderrHandler = StreamLogHandler.standardError(label: label)
-  stderrHandler.logLevel = level
+      var stderrHandler = StreamLogHandler.standardError(label: label)
+      stderrHandler.logLevel = level
 
-  if let logPath = env["QWEN_IMAGE_LOG_FILE"] {
-    let fileURL = URL(fileURLWithPath: logPath)
-    let fileHandler = FileLogHandler(label: label, fileURL: fileURL, level: level)
-    return MultiplexLogHandler([stderrHandler, fileHandler])
-  } else {
-    return stderrHandler
+      if let logPath = env["QWEN_IMAGE_LOG_FILE"] {
+        let fileURL = URL(fileURLWithPath: logPath)
+        let fileHandler = FileLogHandler(label: label, fileURL: fileURL, level: level)
+        return MultiplexLogHandler([stderrHandler, fileHandler])
+      } else {
+        return stderrHandler
+      }
+    }
   }
 }
 
@@ -88,15 +159,12 @@ struct QwenImageCLIEntry {
     logger.logLevel = .info
     return logger
   }()
-  static func run() throws {
+  static func run() async throws {
     if let dev = MTLCreateSystemDefaultDevice() {
       logger.info("Metal device: \(dev.name)")
     } else {
       logger.warning("No Metal device detected; MLX may run on CPU.")
     }
-    let recommendedPreset = GPUCachePolicy.recommendedPreset()
-    GPUCachePolicy.applyPreset(recommendedPreset)
-    logger.info("Applied GPU cache preset: \(recommendedPreset) (system memory: \(GPUCachePolicy.totalSystemMemoryFormatted))")
     Device.setDefault(device: .gpu)
     do {
       let current = Device.defaultDevice()
@@ -123,9 +191,14 @@ struct QwenImageCLIEntry {
     var quantAttnGroupSize: Int?
     var quantAttnMode: QuantizationMode?
     var quantAttnSpecOverride: QwenQuantizationSpec?
-    var quantMinDim = 4096
+    var quantMinDim: Int?
     var quantizeComponents: [String] = ["transformer", "text_encoder"]
     var quantizeSnapshotSwiftOut: String?
+    var dtypeOverride: DType?
+    var gpuCacheLimitBytes: Int?
+    var gpuCacheLimitSpecified = false
+    var profileEnabled = false
+    var clearCacheBetweenStages = false
 
     var isLayeredMode = false
     var layeredImagePath: String?
@@ -192,6 +265,26 @@ struct QwenImageCLIEntry {
         revision = nextValue(for: argument, iterator: &iterator)
       case "--output", "-o":
         outputPath = nextValue(for: argument, iterator: &iterator)
+      case "--dtype":
+        let value = nextValue(for: argument, iterator: &iterator)
+        guard let dtype = DType.parsingTorchDType(value), dtype == .bfloat16 else {
+          fail("Unsupported --dtype \(value). Only bfloat16 is supported.")
+        }
+        dtypeOverride = dtype
+      case "--gpu-cache-limit":
+        let value = nextValue(for: argument, iterator: &iterator)
+        gpuCacheLimitSpecified = true
+        if value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "unlimited" {
+          gpuCacheLimitBytes = nil
+        } else if let parsed = parseByteSize(value) {
+          gpuCacheLimitBytes = parsed
+        } else {
+          fail("Unsupported --gpu-cache-limit \(value). Use e.g. 16gb, 4096mb, 17179869184, or unlimited.")
+        }
+      case "--profile":
+        profileEnabled = true
+      case "--clear-cache-between-stages":
+        clearCacheBetweenStages = true
       case "--true-cfg-scale":
         let value = nextValue(for: argument, iterator: &iterator)
         guard let scale = Float(value) else {
@@ -222,8 +315,8 @@ struct QwenImageCLIEntry {
         }
       case "--quant-min-dim":
         let value = nextValue(for: argument, iterator: &iterator)
-        guard let dim = Int(value), dim > 0 else {
-          fail("Expected positive integer after --quant-min-dim")
+        guard let dim = Int(value), dim >= 0 else {
+          fail("Expected integer >= 0 after --quant-min-dim")
         }
         quantMinDim = dim
       case "--quant-attn":
@@ -283,6 +376,25 @@ struct QwenImageCLIEntry {
       }
     }
 
+    if ProcessInfo.processInfo.environment["QWEN_IMAGE_PROFILE"] != nil {
+      profileEnabled = true
+    }
+
+    if gpuCacheLimitSpecified {
+      if let bytes = gpuCacheLimitBytes {
+        GPUCachePolicy.setCacheLimit(bytes)
+        let formatted = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+        logger.info("Applied GPU cache limit: \(formatted) (system memory: \(GPUCachePolicy.totalSystemMemoryFormatted))")
+      } else {
+        GPUCachePolicy.applyPreset(.unlimited)
+        logger.info("Applied GPU cache preset: Unlimited (system memory: \(GPUCachePolicy.totalSystemMemoryFormatted))")
+      }
+    } else {
+      let recommendedPreset = GPUCachePolicy.recommendedPreset()
+      GPUCachePolicy.applyPreset(recommendedPreset)
+      logger.info("Applied GPU cache preset: \(recommendedPreset) (system memory: \(GPUCachePolicy.totalSystemMemoryFormatted))")
+    }
+
     if quantAttnBits != nil || quantAttnGroupSize != nil || quantAttnMode != nil {
       let bits = quantAttnBits ?? quantBits ?? 8
       let group = quantAttnGroupSize ?? quantGroupSize
@@ -290,152 +402,205 @@ struct QwenImageCLIEntry {
       quantAttnSpecOverride = QwenQuantizationSpec(groupSize: group, bits: bits, mode: mode)
     }
 
-    if isLayeredMode {
-      guard let imagePath = layeredImagePath else {
-        fail("Layered mode requires --layered-image PATH")
+    let runTask = Task {
+      var profiler: CLIProfiler? = profileEnabled ? CLIProfiler() : nil
+      profiler?.mark("Run started", logger: logger)
+      if isLayeredMode {
+        guard let imagePath = layeredImagePath else {
+          fail("Layered mode requires --layered-image PATH")
+        }
+        let env = ProcessInfo.processInfo.environment
+        let hfHomePath = env["HF_HOME"].map { NSString(string: $0).expandingTildeInPath }
+        let cacheOverridePath: String? = hfHomePath.map { $0 + "/hub" }
+
+        let snapshotRoot = try await resolveSnapshot(
+          model: modelArg ?? "Qwen/Qwen-Image-Layered",
+          revision: revision,
+          cacheDirectory: cacheOverridePath,
+          hfToken: nil,
+          offlineMode: false,
+          useBackgroundSession: false
+        )
+        profiler?.mark("Snapshot resolved", logger: logger)
+
+        try await runLayeredGeneration(
+          imagePath: imagePath,
+          snapshotRoot: snapshotRoot,
+          outputPath: outputPath,
+          layers: layeredLayers,
+          resolution: layeredResolution,
+          steps: steps,
+          prompt: prompt,
+          negativePrompt: negativePrompt,
+          trueCFGScale: trueCFGScale,
+          cfgNormalize: layeredCFGNormalize,
+          seed: seed,
+          loraPath: loraArg,
+          dtypeOverride: dtypeOverride
+        )
+        profiler?.mark("Layered run finished", logger: logger)
+        return
       }
+
+      if let outDir = quantizeSnapshotSwiftOut {
+        guard let modelValue = modelArg else {
+          fail("--quantize-model requires --model to point at a local snapshot directory or HF repo id.")
+        }
+        let env = ProcessInfo.processInfo.environment
+        let hfHomePath = env["HF_HOME"].map { NSString(string: $0).expandingTildeInPath }
+        let cacheOverridePath: String? = hfHomePath.map { $0 + "/hub" }
+        let resolvedSnapshot = try await resolveSnapshot(
+          model: modelValue,
+          revision: revision,
+          cacheDirectory: cacheOverridePath,
+          hfToken: nil,
+          offlineMode: false,
+          useBackgroundSession: false
+        )
+        profiler?.mark("Snapshot resolved", logger: logger)
+        try runQuantizeSnapshot(
+          modelPath: resolvedSnapshot.path,
+          outputPath: outDir,
+          components: quantizeComponents,
+          bits: quantBits ?? 8,
+          groupSize: quantGroupSize,
+          mode: quantMode,
+          profileEnabled: profileEnabled
+        )
+        profiler?.mark("Quantize snapshot finished", logger: logger)
+        return
+      }
+
+      guard let prompt else {
+        fail("Missing required --prompt")
+      }
+      logger.debug("Using prompt: \(prompt)")
+
       let env = ProcessInfo.processInfo.environment
       let hfHomePath = env["HF_HOME"].map { NSString(string: $0).expandingTildeInPath }
       let cacheOverridePath: String? = hfHomePath.map { $0 + "/hub" }
 
-      let snapshotRoot = try resolveSnapshot(
-        model: modelArg ?? "Qwen/Qwen-Image-Layered",
+      let snapshotRoot = try await resolveSnapshot(
+        model: modelArg,
         revision: revision,
         cacheDirectory: cacheOverridePath,
         hfToken: nil,
         offlineMode: false,
         useBackgroundSession: false
       )
+      profiler?.mark("Snapshot resolved", logger: logger)
+      if profileEnabled {
+        logSnapshotFootprint(snapshotRoot: snapshotRoot, logger: logger)
+      }
+      let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+      try prepareOutputDirectory(for: outputURL)
 
-      try runLayeredGeneration(
-        imagePath: imagePath,
-        snapshotRoot: snapshotRoot,
-        outputPath: outputPath,
-        layers: layeredLayers,
-        resolution: layeredResolution,
-        steps: steps,
+      let generation = GenerationParameters(
         prompt: prompt,
+        width: width,
+        height: height,
+        steps: steps,
+        guidanceScale: guidance,
         negativePrompt: negativePrompt,
-        trueCFGScale: trueCFGScale,
-        cfgNormalize: layeredCFGNormalize,
         seed: seed,
-        loraPath: loraArg
+        trueCFGScale: trueCFGScale,
+        editResolution: editResolution
       )
-      return
-    }
 
-    if let outDir = quantizeSnapshotSwiftOut {
-      guard let modelValue = modelArg else {
-        fail("--quantize-model requires --model to point at a local snapshot directory or HF repo id.")
+      let isEdit = !referenceImagePaths.isEmpty
+      let pipeline = QwenImagePipeline(config: isEdit ? .imageEditing : .textToImage)
+      pipeline.setDTypeOverride(dtypeOverride)
+      pipeline.setBaseDirectory(snapshotRoot)
+
+      var modelConfig = QwenModelConfiguration()
+      let descriptor = try QwenModelDescriptor.load(from: snapshotRoot)
+      modelConfig.flowMatch = descriptor.flowMatchConfiguration
+      modelConfig.requiresSigmaShift = false
+      logger.info("Loaded model descriptor (\(descriptor.identity))")
+      profiler?.mark("Model descriptor loaded", logger: logger)
+
+      if let bits = quantBits {
+        let spec = QwenQuantizationSpec(groupSize: quantGroupSize, bits: bits, mode: quantMode)
+        let resolvedMinDim = quantMinDim ?? defaultRuntimeQuantMinDim(for: descriptor)
+        pipeline.setRuntimeQuantization(spec, minInputDim: resolvedMinDim)
+        logger.info(
+          "Enabled runtime quantization (bits: \(bits), group: \(quantGroupSize), mode: \(quantMode), min-dim: \(resolvedMinDim))"
+        )
       }
-      let env = ProcessInfo.processInfo.environment
-      let hfHomePath = env["HF_HOME"].map { NSString(string: $0).expandingTildeInPath }
-      let cacheOverridePath: String? = hfHomePath.map { $0 + "/hub" }
-      let resolvedSnapshot = try resolveSnapshot(
-        model: modelValue,
-        revision: revision,
-        cacheDirectory: cacheOverridePath,
-        hfToken: nil,
-        offlineMode: false,
-        useBackgroundSession: false
-      )
-      try runQuantizeSnapshot(
-        modelPath: resolvedSnapshot.path,
-        outputPath: outDir,
-        components: quantizeComponents,
-        bits: quantBits ?? 8,
-        groupSize: quantGroupSize,
-        mode: quantMode
-      )
-      return
-    }
 
-    guard let prompt else {
-      fail("Missing required --prompt")
-    }
-    logger.debug("Using prompt: \(prompt)")
-
-    let env = ProcessInfo.processInfo.environment
-    let hfHomePath = env["HF_HOME"].map { NSString(string: $0).expandingTildeInPath }
-    let cacheOverridePath: String? = hfHomePath.map { $0 + "/hub" }
-
-    let snapshotRoot = try resolveSnapshot(
-      model: modelArg,
-      revision: revision,
-      cacheDirectory: cacheOverridePath,
-      hfToken: nil,
-      offlineMode: false,
-      useBackgroundSession: false
-    )
-    let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
-    try prepareOutputDirectory(for: outputURL)
-
-    let generation = GenerationParameters(
-      prompt: prompt,
-      width: width,
-      height: height,
-      steps: steps,
-      guidanceScale: guidance,
-      negativePrompt: negativePrompt,
-      seed: seed,
-      trueCFGScale: trueCFGScale,
-      editResolution: editResolution
-    )
-    
-    let isEdit = !referenceImagePaths.isEmpty
-    let pipeline = QwenImagePipeline(config: isEdit ? .imageEditing : .textToImage)
-    pipeline.setBaseDirectory(snapshotRoot)
-    if let bits = quantBits {
-      let spec = QwenQuantizationSpec(groupSize: quantGroupSize, bits: bits, mode: quantMode)
-      pipeline.setRuntimeQuantization(spec, minInputDim: quantMinDim)
-      logger.info("Enabled runtime quantization (bits: \(bits), group: \(quantGroupSize), mode: \(quantMode), min-dim: \(quantMinDim))")
-    }
-
-    let transformerConfig = QwenTransformerConfiguration()
-    var modelConfig = QwenModelConfiguration()
-    do {
-      if let flowMatchConfig = try QwenFlowMatchConfig.load(fromSchedulerDirectory: snapshotRoot.appending(path: "scheduler")) {
-        modelConfig.flowMatch = flowMatchConfig
-        modelConfig.requiresSigmaShift = flowMatchConfig.useDynamicShifting
-        logger.info("Loaded FlowMatch scheduler config (dynamic shifting: \(flowMatchConfig.useDynamicShifting))")
+      logger.info("Loading tokenizer and text encoder from \(snapshotRoot.path)")
+      try pipeline.prepareTokenizer(from: snapshotRoot, maxLength: nil)
+      profiler?.mark("Tokenizer loaded", logger: logger)
+      try pipeline.prepareTextEncoder(from: snapshotRoot)
+      profiler?.mark("Text encoder loaded", logger: logger)
+      if isEdit {
+        try pipeline.prepareVAE(from: snapshotRoot)
+        profiler?.mark("VAE loaded", logger: logger)
       }
-    } catch {
-      logger.warning("Failed to load FlowMatch scheduler config: \(error). Falling back to defaults.")
-    }
 
-    logger.info("Loading tokenizer and text encoder from \(snapshotRoot.path)")
-    try pipeline.prepareTokenizer(from: snapshotRoot, maxLength: nil)
-    try pipeline.prepareTextEncoder(from: snapshotRoot)
-    if isEdit {
-      try pipeline.prepareVAE(from: snapshotRoot)
-    }
+      if let lora = loraArg {
+        let loraURL = try await resolveLoraSafetensors(
+          lora: lora,
+          cacheDirectory: cacheOverridePath,
+          hfToken: nil,
+          offlineMode: false,
+          useBackgroundSession: false
+        )
+        logger.info("Queuing LoRA for lazy application from \(loraURL.path)")
+        pipeline.setPendingLora(from: loraURL)
+        profiler?.mark("LoRA resolved", logger: logger)
+      }
 
-    if let lora = loraArg {
-      let loraURL = try resolveLoraSafetensors(
-        lora: lora,
-        cacheDirectory: cacheOverridePath,
-        hfToken: nil,
-        offlineMode: false,
-        useBackgroundSession: false
-      )
-      logger.info("Queuing LoRA for lazy application from \(loraURL.path)")
-      pipeline.setPendingLora(from: loraURL)
-    }
+      if let spec = quantAttnSpecOverride {
+        pipeline.setAttentionQuantization(spec)
+        logger.info("Enabled attention quantization override (bits: \(spec.bits), group: \(spec.groupSize), mode: \(spec.mode)).")
+      }
 
-    if let spec = quantAttnSpecOverride {
-      pipeline.setAttentionQuantization(spec)
-      logger.info("Enabled attention quantization override (bits: \(spec.bits), group: \(spec.groupSize), mode: \(spec.mode)).")
-    }
+      let pixels: MLXArray
+      if !isEdit {
+        if profileEnabled || clearCacheBetweenStages {
+          let promptLength = modelConfig.maxSequenceLength
+          let dtype = dtypeOverride ?? descriptor.textEncoderConfiguration.outputDType
+          let guidanceEncoding = try pipeline.encodeGuidancePrompts(
+            prompt: generation.prompt,
+            negativePrompt: generation.negativePrompt,
+            maxLength: promptLength
+          )
+          let materialized = materializeGuidanceEncoding(guidanceEncoding, dtype: dtype)
+          profiler?.mark("Prompts encoded", logger: logger)
 
-    let pixels: MLXArray
-    if !isEdit {
-      logger.info("Generating image")
-      pixels = try pipeline.generatePixels(
-        parameters: generation,
-        model: modelConfig,
-        seed: seed
-      )
-    } else {
+          pipeline.releaseTextEncoder()
+          profiler?.mark("Text encoder released", logger: logger)
+
+          if clearCacheBetweenStages {
+            GPUCachePolicy.clearCache()
+            profiler?.mark("GPU cache cleared", logger: logger)
+          }
+
+          try pipeline.prepareUNet(from: snapshotRoot)
+          profiler?.mark("UNet loaded", logger: logger)
+
+          try pipeline.prepareVAE(from: snapshotRoot)
+          profiler?.mark("VAE loaded", logger: logger)
+
+          logger.info("Generating image")
+          pixels = try await pipeline.generatePixels(
+            parameters: generation,
+            model: modelConfig,
+            guidanceEncoding: materialized,
+            seed: seed
+          )
+          profiler?.mark("Denoising finished", logger: logger)
+        } else {
+          logger.info("Generating image")
+          pixels = try await pipeline.generatePixels(
+            parameters: generation,
+            model: modelConfig,
+            seed: seed
+          )
+          profiler?.mark("Generation finished", logger: logger)
+        }
+      } else {
 #if canImport(CoreGraphics)
         guard !referenceImagePaths.isEmpty else {
           fail("Edit mode requires at least one --reference-image.")
@@ -444,7 +609,7 @@ struct QwenImageCLIEntry {
         logger.info("Using edit canvas \(generation.width)x\(generation.height)")
         logger.info("Generating image edit")
         if referenceImagePaths.count == 1 {
-          pixels = try pipeline.generateEditedPixels(
+          pixels = try await pipeline.generateEditedPixels(
             parameters: generation,
             model: modelConfig,
             referenceImage: primaryReference,
@@ -458,7 +623,7 @@ struct QwenImageCLIEntry {
           }
           let second = loadCGImage(at: referenceImagePaths[1])
           images.append(second)
-          pixels = try pipeline.generateEditedPixels(
+          pixels = try await pipeline.generateEditedPixels(
             parameters: generation,
             model: modelConfig,
             referenceImages: images,
@@ -466,14 +631,31 @@ struct QwenImageCLIEntry {
             seed: seed
           )
         }
+        profiler?.mark("Edit generation finished", logger: logger)
 #else
         fail("Native edit mode requires CoreGraphics support on this platform.")
 #endif
+      }
+
+      let image = try pipeline.makeImage(from: pixels)
+      try save(image: image, to: outputURL)
+      logger.info("Saved image to \(outputURL.path)")
+      profiler?.mark("Output saved", logger: logger)
     }
 
-    let image = try pipeline.makeImage(from: pixels)
-    try save(image: image, to: outputURL)
-    logger.info("Saved image to \(outputURL.path)")
+    let signalSources = installCancellationSignals(for: runTask)
+    defer {
+      for source in signalSources {
+        source.cancel()
+      }
+    }
+
+    do {
+      try await runTask.value
+    } catch is CancellationError {
+      logger.warning("Cancelled.")
+      exit(130)
+    }
   }
 
   private static func nextValue(
@@ -486,6 +668,115 @@ struct QwenImageCLIEntry {
     return value
   }
 
+  private static func parseByteSize(_ raw: String) -> Int? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let normalized = trimmed.replacingOccurrences(of: "_", with: "").lowercased()
+
+    var numberPart = ""
+    var suffixPart = ""
+
+    for character in normalized {
+      if character.isNumber || character == "." {
+        if !suffixPart.isEmpty { return nil }
+        numberPart.append(character)
+      } else {
+        suffixPart.append(character)
+      }
+    }
+
+    guard let value = Double(numberPart) else { return nil }
+
+    let multiplier: Double
+    switch suffixPart {
+    case "", "b", "bytes":
+      multiplier = 1
+    case "k", "kb":
+      multiplier = 1024
+    case "m", "mb":
+      multiplier = 1024 * 1024
+    case "g", "gb":
+      multiplier = 1024 * 1024 * 1024
+    case "t", "tb":
+      multiplier = 1024 * 1024 * 1024 * 1024
+    default:
+      return nil
+    }
+
+    let bytes = value * multiplier
+    guard bytes.isFinite, bytes > 0 else { return nil }
+    return Int(bytes.rounded())
+  }
+
+  private static func directorySizeBytes(_ url: URL) -> UInt64? {
+    let fm = FileManager.default
+    guard let enumerator = fm.enumerator(
+      at: url,
+      includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return nil
+    }
+
+    var total: UInt64 = 0
+    for case let fileURL as URL in enumerator {
+      do {
+        let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { continue }
+        total &+= UInt64(values.fileSize ?? 0)
+      } catch {
+        continue
+      }
+    }
+    return total
+  }
+
+  private static func logSnapshotFootprint(snapshotRoot: URL, logger: Logger) {
+    let transformer = snapshotRoot.appending(path: "transformer")
+    let textEncoder = snapshotRoot.appending(path: "text_encoder")
+    let vae = snapshotRoot.appending(path: "vae")
+
+    let transformerBytes = directorySizeBytes(transformer)
+    let textEncoderBytes = directorySizeBytes(textEncoder)
+    let vaeBytes = directorySizeBytes(vae)
+
+    func format(_ bytes: UInt64?) -> String {
+      guard let bytes else { return "unknown" }
+      return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    logger.info(
+      "[profile] Snapshot footprint: transformer=\(format(transformerBytes)), text_encoder=\(format(textEncoderBytes)), vae=\(format(vaeBytes))"
+    )
+  }
+
+  private static func materializeGuidanceEncoding(
+    _ encoding: QwenGuidanceEncoding,
+    dtype: DType
+  ) -> QwenGuidanceEncoding {
+    let unconditionalEmbeddings = encoding.unconditionalEmbeddings.asType(dtype)
+    let conditionalEmbeddings = encoding.conditionalEmbeddings.asType(dtype)
+    let unconditionalMask = encoding.unconditionalMask.asType(.int32)
+    let conditionalMask = encoding.conditionalMask.asType(.int32)
+    MLX.eval(unconditionalEmbeddings, unconditionalMask, conditionalEmbeddings, conditionalMask)
+
+    return QwenGuidanceEncoding(
+      unconditionalEmbeddings: unconditionalEmbeddings,
+      conditionalEmbeddings: conditionalEmbeddings,
+      unconditionalMask: unconditionalMask,
+      conditionalMask: conditionalMask,
+      tokenBatch: encoding.tokenBatch
+    )
+  }
+
+  private static func defaultRuntimeQuantMinDim(for descriptor: QwenModelDescriptor) -> Int {
+    let maxDefault = 4096
+    let textDim = descriptor.textEncoderConfiguration.hiddenSize
+    let transformer = descriptor.transformerConfiguration
+    let innerDim = transformer.numberOfHeads * transformer.attentionHeadDim
+    return max(0, min(maxDefault, innerDim, textDim))
+  }
+
   private static func resolveSnapshot(
     model: String?,
     revision: String,
@@ -493,28 +784,37 @@ struct QwenImageCLIEntry {
     hfToken: String?,
     offlineMode: Bool,
     useBackgroundSession: Bool
-  ) throws -> URL {
-    if let model {
-      let url = URL(fileURLWithPath: model).standardizedFileURL
-      if FileManager.default.fileExists(atPath: url.path) {
+	  ) async throws -> URL {
+	    if let model {
+	      let url = URL(fileURLWithPath: model).standardizedFileURL
+	      var isDirectory: ObjCBool = false
+      if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+        guard isDirectory.boolValue else {
+          fail("Model path must be a directory: \(url.path)")
+        }
         return url
       }
-      let cacheURL = cacheDirectory.map { URL(fileURLWithPath: $0).standardizedFileURL }
-      let options = QwenModelRepository.snapshotOptions(
-        repoId: model,
-        revision: revision,
-        cacheDirectory: cacheURL,
-        hfToken: hfToken,
-        offline: offlineMode,
-        useBackgroundSession: useBackgroundSession
-      )
-      logger.info("Resolving snapshot for \(model) (revision: \(revision))")
-      let snapshotURL = try downloadSnapshot(options: options)
-      logger.info("Snapshot ready at \(snapshotURL.path)")
-      return snapshotURL
-    }
-    fail("Model not provided. Pass --model with a local path or HF repo id.")
-  }
+	      let cacheURL = cacheDirectory.map { URL(fileURLWithPath: $0).standardizedFileURL }
+	      let options: HubSnapshotOptions
+	      do {
+	        options = try QwenModelRepository.snapshotOptions(
+	          repoId: model,
+	          revision: revision,
+	          cacheDirectory: cacheURL,
+	          hfToken: hfToken,
+	          offline: offlineMode,
+	          useBackgroundSession: useBackgroundSession
+	        )
+	      } catch {
+	        fail(error.localizedDescription)
+	      }
+	      logger.info("Resolving snapshot for \(model) (revision: \(revision))")
+	      let snapshotURL = try await downloadSnapshot(options: options)
+	      logger.info("Snapshot ready at \(snapshotURL.path)")
+	      return snapshotURL
+	    }
+	    fail("Model not provided. Pass --model with a local path or HF repo id.")
+	  }
 
   private static func resolveLoraSafetensors(
     lora: String,
@@ -522,7 +822,7 @@ struct QwenImageCLIEntry {
     hfToken: String?,
     offlineMode: Bool,
     useBackgroundSession: Bool
-  ) throws -> URL {
+  ) async throws -> URL {
     let fm = FileManager.default
     let localURL = URL(fileURLWithPath: lora).standardizedFileURL
 
@@ -557,7 +857,7 @@ struct QwenImageCLIEntry {
       useBackgroundSession: useBackgroundSession
     )
     logger.info("Resolving LoRA snapshot for \(repoId) (revision: \(revision))")
-    let snapshotRoot = try downloadSnapshot(options: options)
+    let snapshotRoot = try await downloadSnapshot(options: options)
 
     var snapshotIsDir: ObjCBool = false
     if fm.fileExists(atPath: snapshotRoot.path, isDirectory: &snapshotIsDir) {
@@ -613,40 +913,19 @@ struct QwenImageCLIEntry {
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
-  private static func downloadSnapshot(options: HubSnapshotOptions) throws -> URL {
+  private static func downloadSnapshot(options: HubSnapshotOptions) async throws -> URL {
     let snapshot = try HubSnapshot(options: options)
     let progressFlag = MutableBox(false)
-    let url = try blockingAwait {
-      try await snapshot.prepare { progress in
-        guard progress.totalUnitCount > 0 else { return }
-        progressFlag.value = true
-        Self.printDownloadProgress(progress)
-      }
+    let url = try await snapshot.prepare { progress in
+      guard progress.totalUnitCount > 0 else { return }
+      progressFlag.value = true
+      Self.printDownloadProgress(progress)
     }
     if progressFlag.value {
       let data = Data("\n".utf8)
       try? FileHandle.standardError.write(contentsOf: data)
     }
     return url
-  }
-
-  private static func blockingAwait<T>(_ operation: @escaping () async throws -> T) throws -> T {
-    let semaphore = DispatchSemaphore(value: 0)
-    let resultBox = MutableBox<Result<T, Error>?>(nil)
-    Task {
-      do {
-        let value = try await operation()
-        resultBox.value = .success(value)
-      } catch {
-        resultBox.value = .failure(error)
-      }
-      semaphore.signal()
-    }
-    semaphore.wait()
-    guard let result = resultBox.value else {
-      fatalError("Snapshot task completed without a result.")
-    }
-    return try result.get()
   }
 
   private static func printDownloadProgress(_ progress: HubSnapshotProgress) {
@@ -757,10 +1036,14 @@ struct QwenImageCLIEntry {
       --steps, -s             Number of diffusion steps (default: 30)
       --guidance, -g          Guidance scale (default: 4.0)
       --true-cfg-scale        True CFG scale (matches diffusers `true_cfg_scale`)
+      --dtype                 Override weight/compute dtype (bfloat16)
+      --gpu-cache-limit       Override MLX GPU cache limit (e.g. 16gb, 4096mb, unlimited)
+      --profile               Emit profiling checkpoints (timing + RSS)
+      --clear-cache-between-stages Clear MLX GPU cache between prompt encoding and denoising
       --width, -W             Image width (default: 1024)
       --height, -H            Image height (default: 1024)
       --seed                  Random seed (optional)
-      --model                 HF repo ID (e.g. Qwen/Qwen-Image-Edit-2509) or local snapshot path
+      --model                 HF repo ID (e.g. Qwen/Qwen-Image-Edit-2511) or local snapshot path
       --lora                  Optional LoRA safetensors path, HF repo ID, or HF file URL (e.g. Osrivers/Qwen-Image-Lightning-4steps-V2.0-bf16.safetensors or repo:file.safetensors)
       --revision              Snapshot revision/tag/commit (used with HF repo IDs; default: main)
       --output, -o            Output PNG path (default: qwen-image.png)
@@ -806,6 +1089,25 @@ struct QwenImageCLIEntry {
     exit(2)
   }
 
+  private static func installCancellationSignals(for task: Task<Void, Error>) -> [DispatchSourceSignal] {
+    let signals: [Int32] = [SIGINT, SIGTERM]
+    let queue = DispatchQueue(label: "qwen.image.cli.signals")
+    var sources: [DispatchSourceSignal] = []
+    sources.reserveCapacity(signals.count)
+
+    for signalNumber in signals {
+      signal(signalNumber, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: queue)
+      source.setEventHandler {
+        logger.warning("Received signal \(signalNumber); cancelling task.")
+        task.cancel()
+      }
+      source.resume()
+      sources.append(source)
+    }
+    return sources
+  }
+
   private static func runLayeredGeneration(
     imagePath: String,
     snapshotRoot: URL,
@@ -818,16 +1120,15 @@ struct QwenImageCLIEntry {
     trueCFGScale: Float?,
     cfgNormalize: Bool,
     seed: UInt64?,
-    loraPath: String?
-  ) throws {
+    loraPath: String?,
+    dtypeOverride: DType?
+  ) async throws {
 #if canImport(CoreGraphics)
     logger.info("Loading layered pipeline from \(snapshotRoot.path)")
-    let pipeline = try blockingAwait {
-      try await QwenLayeredPipeline.load(from: snapshotRoot)
-    }
+    let pipeline = try await QwenLayeredPipeline.load(from: snapshotRoot, dtypeOverride: dtypeOverride)
 
     if let loraPath = loraPath {
-      let loraURL = try resolveLoraSafetensors(
+      let loraURL = try await resolveLoraSafetensors(
         lora: loraPath,
         cacheDirectory: nil,
         hfToken: nil,
@@ -855,7 +1156,7 @@ struct QwenImageCLIEntry {
 
     logger.info("Generating \(layers) layers at \(resolution)x\(resolution) with \(steps) steps")
 
-    let layerImages = try pipeline.generate(
+    let layerImages = try await pipeline.generate(
       image: inputArray,
       parameters: parameters
     ) { _, _, _ in
@@ -1002,16 +1303,55 @@ struct QwenImageCLIEntry {
   }
 #endif
 
-  private static func collectLinearLayerRegistry(
-    modelPath: String
-  ) throws -> [String: [String]] {
-    let snapshotURL = URL(fileURLWithPath: modelPath)
-    let pipeline = QwenImagePipeline(config: .textToImage)
-    let transformerConfig = QwenTransformerConfiguration()
-    try pipeline.prepareTextEncoder(from: snapshotURL)
-    try pipeline.prepareUNet(from: snapshotURL, configuration: transformerConfig)
-    let registry = LinearLayerRegistry.snapshotAndReset()
-    return registry
+  private static func allowedLinearLayerBases(
+    snapshotRoot: URL
+  ) throws -> [String: Set<String>] {
+    let descriptor = try QwenModelDescriptor.load(from: snapshotRoot)
+
+    let transformerLayers = descriptor.transformerConfiguration.numberOfLayers
+    var transformerBases = Set<String>()
+    transformerBases.insert("img_in")
+    transformerBases.insert("txt_in")
+    transformerBases.insert("time_text_embed.timestep_embedder.linear_1")
+    transformerBases.insert("time_text_embed.timestep_embedder.linear_2")
+    transformerBases.insert("norm_out.linear")
+    transformerBases.insert("proj_out")
+    for index in 0..<transformerLayers {
+      let prefix = "transformer_blocks.\(index)"
+      transformerBases.insert("\(prefix).img_mod.1")
+      transformerBases.insert("\(prefix).txt_mod.1")
+      transformerBases.insert("\(prefix).attn.to_q")
+      transformerBases.insert("\(prefix).attn.to_k")
+      transformerBases.insert("\(prefix).attn.to_v")
+      transformerBases.insert("\(prefix).attn.add_q_proj")
+      transformerBases.insert("\(prefix).attn.add_k_proj")
+      transformerBases.insert("\(prefix).attn.add_v_proj")
+      transformerBases.insert("\(prefix).attn.to_out.0")
+      transformerBases.insert("\(prefix).attn.to_add_out")
+      transformerBases.insert("\(prefix).img_mlp.net.0.proj")
+      transformerBases.insert("\(prefix).img_mlp.net.2")
+      transformerBases.insert("\(prefix).txt_mlp.net.0.proj")
+      transformerBases.insert("\(prefix).txt_mlp.net.2")
+    }
+
+    let textLayers = descriptor.textEncoderConfiguration.numHiddenLayers
+    var textEncoderBases = Set<String>()
+    textEncoderBases.insert("model.embed_tokens")
+    for index in 0..<textLayers {
+      let prefix = "model.layers.\(index)"
+      textEncoderBases.insert("\(prefix).self_attn.q_proj")
+      textEncoderBases.insert("\(prefix).self_attn.k_proj")
+      textEncoderBases.insert("\(prefix).self_attn.v_proj")
+      textEncoderBases.insert("\(prefix).self_attn.o_proj")
+      textEncoderBases.insert("\(prefix).mlp.gate_proj")
+      textEncoderBases.insert("\(prefix).mlp.up_proj")
+      textEncoderBases.insert("\(prefix).mlp.down_proj")
+    }
+
+    return [
+      "transformer": transformerBases,
+      "text_encoder": textEncoderBases
+    ]
   }
 
   private static func runQuantizeSnapshot(
@@ -1020,37 +1360,30 @@ struct QwenImageCLIEntry {
     components: [String],
     bits: Int,
     groupSize: Int,
-    mode: QuantizationMode
+    mode: QuantizationMode,
+    profileEnabled: Bool = false
   ) throws {
     let snapshotURL = URL(fileURLWithPath: modelPath)
     let outputURL = URL(fileURLWithPath: outputPath)
     try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
     let spec = QwenQuantizationSpec(groupSize: groupSize, bits: bits, mode: mode)
     logger.info("Swift quantize+save (bits=\(bits), group=\(groupSize), mode=\(mode), components=\(components.joined(separator: ",")))")
-    var allowedMap: [String: Set<String>] = [:]
-    let registry = try collectLinearLayerRegistry(modelPath: modelPath)
-    for (comp, list) in registry {
-      allowedMap[comp] = Set(list)
-    }
-    func canonicalize(_ name: String, component: String) -> String {
-      var n = name
-      if component == "text_encoder" {
-        if n.hasPrefix("encoder.") { n = "model." + n.dropFirst("encoder.".count) }
+    var shardProfiler: CLIProfiler? = profileEnabled ? CLIProfiler() : nil
+    let allowedMap = try allowedLinearLayerBases(snapshotRoot: snapshotURL)
+    try SwiftQuantSaver.quantizeAndSave(
+      from: snapshotURL,
+      to: outputURL,
+      components: components,
+      spec: spec,
+      allowedLayerMap: allowedMap,
+      progress: { label in
+        if profileEnabled {
+          shardProfiler?.mark(label, logger: logger)
+        } else {
+          logger.info("\(label)")
+        }
       }
-      n = n.replacingOccurrences(of: ".img_ff.mlp_in", with: ".img_mlp.net.0.proj")
-      n = n.replacingOccurrences(of: ".img_ff.mlp_out", with: ".img_mlp.net.2")
-      n = n.replacingOccurrences(of: ".txt_ff.mlp_in", with: ".txt_mlp.net.0.proj")
-      n = n.replacingOccurrences(of: ".txt_ff.mlp_out", with: ".txt_mlp.net.2")
-      n = n.replacingOccurrences(of: ".attn.attn_to_out", with: ".attn.to_out.0")
-      return n
-    }
-    var allowedMapHF: [String: Set<String>] = [:]
-    for (comp, set) in allowedMap {
-      var out = Set<String>()
-      for name in set { out.insert(canonicalize(name, component: comp)) }
-      allowedMapHF[comp] = out
-    }
-    try SwiftQuantSaver.quantizeAndSave(from: snapshotURL, to: outputURL, components: components, spec: spec, allowedLayerMap: allowedMapHF)
+    )
 
     let excludedDirs: Set<String> = ["transformer", "text_encoder"]
     let excludedFiles: Set<String> = ["quantization.json"]
@@ -1078,9 +1411,15 @@ struct QwenImageCLIEntry {
   }
 }
 
-do {
-  try QwenImageCLIEntry.run()
-} catch {
-  QwenImageCLIEntry.logger.error("Unhandled error: \(error)")
-  exit(1)
+@main
+enum QwenImageCLIEntryPoint {
+  static func main() async {
+    QwenImageCLILogging.bootstrap()
+    do {
+      try await QwenImageCLIEntry.run()
+    } catch {
+      QwenImageCLIEntry.logger.error("Unhandled error: \(error)")
+      exit(1)
+    }
+  }
 }

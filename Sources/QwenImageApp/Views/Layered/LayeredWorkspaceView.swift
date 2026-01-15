@@ -69,6 +69,13 @@ struct LayeredWorkspaceView: View {
         appState.showError(error.localizedDescription)
       }
     }
+    .onChange(of: viewModel.selectedLoRAPath) { _, _ in
+      guard !viewModel.generationState.isGenerating else { return }
+      Task {
+        guard await appState.modelService.hasLayeredSession else { return }
+        await appState.modelService.unloadLayeredPipeline()
+      }
+    }
   }
 
   // MARK: - Main Canvas

@@ -17,6 +17,9 @@ public struct PromptEmbeddingsCacheKey: Hashable, Sendable {
   /// Model revision/commit hash
   public let revision: String
 
+  /// Model architecture/config identity (prevents cross-variant cache collisions)
+  public let modelDescriptorId: String
+
   /// Quantization configuration identifier (e.g., "q4_64_affine" or "none")
   public let quantizationId: String
 
@@ -35,6 +38,7 @@ public struct PromptEmbeddingsCacheKey: Hashable, Sendable {
   public init(
     modelId: String,
     revision: String = "main",
+    modelDescriptorId: String = "",
     quantizationId: String = "none",
     dtype: String = "bfloat16",
     maxLength: Int,
@@ -43,6 +47,7 @@ public struct PromptEmbeddingsCacheKey: Hashable, Sendable {
   ) {
     self.modelId = modelId
     self.revision = revision
+    self.modelDescriptorId = modelDescriptorId
     self.quantizationId = quantizationId
     self.dtype = dtype
     self.maxLength = maxLength
@@ -214,23 +219,19 @@ extension PromptEmbeddingsCacheKey {
     negativePrompt: String? = nil
   ) -> PromptEmbeddingsCacheKey {
     let modelId = modelPath.lastPathComponent
+    let modelDescriptorId = (try? QwenModelDescriptor.load(from: modelPath).identity) ?? ""
     let quantId: String
     if let q = quantization {
       quantId = "q\(q.bits)_\(q.groupSize)_\(q.mode)"
     } else {
       quantId = "none"
     }
-    let dtypeStr: String
-    switch dtype {
-    case .bfloat16: dtypeStr = "bfloat16"
-    case .float16: dtypeStr = "float16"
-    case .float32: dtypeStr = "float32"
-    default: dtypeStr = "other"
-    }
+    let dtypeStr = dtype.stableName
 
     return PromptEmbeddingsCacheKey(
       modelId: modelId,
       revision: revision,
+      modelDescriptorId: modelDescriptorId,
       quantizationId: quantId,
       dtype: dtypeStr,
       maxLength: maxLength,

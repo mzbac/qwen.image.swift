@@ -50,8 +50,8 @@ final class LayeredQuantizationTests: XCTestCase {
     try manifestData.write(to: manifestURL)
 
     let plan = try XCTUnwrap(
-      QwenLayeredPipeline.quantizationPlan(
-        forLayeredComponentAt: root,
+      QwenQuantizationPlanResolver.resolve(
+        root: root,
         configRelativePath: "transformer/config.json"
       )
     )

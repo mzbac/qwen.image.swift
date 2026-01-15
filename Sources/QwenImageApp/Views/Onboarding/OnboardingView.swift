@@ -191,26 +191,32 @@ struct OnboardingView: View {
         Text("Speed Boost (Optional)")
           .font(.title2.bold())
 
-        Text("The Lightning LoRA enables blazing-fast generation in just 4 steps instead of 20+.\n\nThis is optional but recommended for faster iteration.")
+        Text("Lightning LoRAs enable blazing-fast generation in just 4 steps instead of 20+.\n\nThese are optional but recommended for faster iteration.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .multilineTextAlignment(.center)
       }
 
-      // Status based on appState
-      switch appState.lightningLoRAStatus {
-      case .notDownloaded:
-        if kDefaultLightningLoRAPath != nil {
-          installedIndicator
-        } else {
-          downloadButton
-        }
-      case .downloading(let progress, let description):
-        downloadingIndicator(progress: progress, description: description)
-      case .downloaded:
-        installedIndicator
-      case .error(let message):
-        errorIndicator(message: message)
+      VStack(spacing: 16) {
+        lightningCard(
+          title: "Text-to-Image Lightning (2512)",
+          status: appState.textToImageLightningLoRAStatus,
+          isInstalled: kDefaultTextToImageLightningLoRAPath != nil,
+          downloadTitle: "Download 2512 Lightning LoRA",
+          onDownload: { await downloadTextToImageLightningLoRA() },
+          onCancel: { cancelTextToImageLightningLoRADownload() },
+          onRetry: { await downloadTextToImageLightningLoRA() }
+        )
+
+        lightningCard(
+          title: "Editing Lightning (2511)",
+          status: appState.lightningLoRAStatus,
+          isInstalled: kDefaultLightningLoRAPath != nil,
+          downloadTitle: "Download 2511 Lightning LoRA",
+          onDownload: { await downloadLightningLoRA() },
+          onCancel: { cancelLightningLoRADownload() },
+          onRetry: { await downloadLightningLoRA() }
+        )
       }
 
       Text("You can skip this and download later from Model Manager")
@@ -226,7 +232,57 @@ struct OnboardingView: View {
       if kDefaultLightningLoRAPath != nil && appState.lightningLoRAStatus == .notDownloaded {
         appState.lightningLoRAStatus = .downloaded
       }
+      if kDefaultTextToImageLightningLoRAPath != nil && appState.textToImageLightningLoRAStatus == .notDownloaded {
+        appState.textToImageLightningLoRAStatus = .downloaded
+      }
     }
+  }
+
+  @ViewBuilder
+  private func lightningCard(
+    title: String,
+    status: AppState.LightningLoRAStatus,
+    isInstalled: Bool,
+    downloadTitle: String,
+    onDownload: @escaping @Sendable () async -> Void,
+    onCancel: @escaping @Sendable () -> Void,
+    onRetry: @escaping @Sendable () async -> Void
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text(title)
+        .font(.headline)
+
+      switch status {
+      case .notDownloaded:
+        if isInstalled {
+          installedIndicator
+        } else {
+          Button {
+            Task { await onDownload() }
+          } label: {
+            Label(downloadTitle, systemImage: "arrow.down.circle")
+              .frame(maxWidth: 300)
+          }
+          .buttonStyle(.borderedProminent)
+        }
+      case .downloading(let progress, let description):
+        downloadingIndicator(progress: progress, description: description, onCancel: onCancel)
+      case .downloaded:
+        installedIndicator
+      case .error(let message):
+        errorIndicator(message: message, onRetry: onRetry)
+      }
+    }
+    .frame(maxWidth: 360)
+    .padding()
+    .background(
+      RoundedRectangle(cornerRadius: 12)
+        .fill(Color(nsColor: .controlBackgroundColor))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 12)
+        .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 1)
+    )
   }
 
   @ViewBuilder
@@ -237,30 +293,15 @@ struct OnboardingView: View {
       Text("Already installed!")
         .foregroundStyle(.green)
     }
-    .padding()
-    .background(
-      RoundedRectangle(cornerRadius: 12)
-        .fill(Color.green.opacity(0.1))
-    )
+    .padding(.vertical, 6)
   }
 
   @ViewBuilder
-  private var downloadButton: some View {
-    VStack(spacing: 12) {
-      Button {
-        Task {
-          await downloadLightningLoRA()
-        }
-      } label: {
-        Label("Download Lightning LoRA", systemImage: "arrow.down.circle")
-          .frame(maxWidth: 300)
-      }
-      .buttonStyle(.borderedProminent)
-    }
-  }
-
-  @ViewBuilder
-  private func downloadingIndicator(progress: Double, description: String) -> some View {
+  private func downloadingIndicator(
+    progress: Double,
+    description: String,
+    onCancel: @escaping @Sendable () -> Void
+  ) -> some View {
     VStack(spacing: 8) {
       ProgressView(value: progress)
         .progressViewStyle(.linear)
@@ -279,14 +320,17 @@ struct OnboardingView: View {
       .frame(maxWidth: 300)
       
       Button("Cancel") {
-        cancelLightningLoRADownload()
+        onCancel()
       }
       .buttonStyle(.bordered)
     }
   }
 
   @ViewBuilder
-  private func errorIndicator(message: String) -> some View {
+  private func errorIndicator(
+    message: String,
+    onRetry: @escaping @Sendable () async -> Void
+  ) -> some View {
     VStack(spacing: 8) {
       HStack {
         Image(systemName: "exclamationmark.triangle.fill")
@@ -297,9 +341,7 @@ struct OnboardingView: View {
       }
       
       Button("Retry") {
-        Task {
-          await downloadLightningLoRA()
-        }
+        Task { await onRetry() }
       }
       .buttonStyle(.borderedProminent)
     }
@@ -308,6 +350,7 @@ struct OnboardingView: View {
   // MARK: - Lightning LoRA Download
 
   @State private var lightningLoRATask: Task<Void, Never>?
+  @State private var textToImageLightningLoRATask: Task<Void, Never>?
 
   private func downloadLightningLoRA() async {
     appState.lightningLoRAStatus = .downloading(progress: 0, description: "Starting...")
@@ -332,8 +375,12 @@ struct OnboardingView: View {
           }
         }
 
+        let loraPath = await localAppState.modelService.lightningLoRAPath()
         await MainActor.run {
           localAppState.lightningLoRAStatus = .downloaded
+          if let loraPath {
+            localAppState.editingViewModel.selectedLoRAPath = loraPath
+          }
         }
       } catch {
         await MainActor.run {
@@ -355,6 +402,59 @@ struct OnboardingView: View {
     lightningLoRATask?.cancel()
     lightningLoRATask = nil
     appState.lightningLoRAStatus = .notDownloaded
+  }
+
+  private func downloadTextToImageLightningLoRA() async {
+    appState.textToImageLightningLoRAStatus = .downloading(progress: 0, description: "Starting...")
+
+    let localAppState = appState
+
+    let task = Task {
+      do {
+        _ = try await localAppState.modelService.downloadTextToImageLightningLoRA { progress in
+          Task { @MainActor in
+            let description: String
+            if let speed = progress.formattedSpeed {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal) @ \(speed)"
+            } else {
+              description = "\(progress.formattedCompleted) / \(progress.formattedTotal)"
+            }
+
+            localAppState.textToImageLightningLoRAStatus = .downloading(
+              progress: progress.fractionCompleted,
+              description: description
+            )
+          }
+        }
+
+        let loraPath = await localAppState.modelService.textToImageLightningLoRAPath()
+        await MainActor.run {
+          localAppState.textToImageLightningLoRAStatus = .downloaded
+          if let loraPath {
+            localAppState.textToImageViewModel.selectedLoRAPath = loraPath
+            localAppState.textToImageViewModel.applyLightningDefaultsIfNeeded()
+          }
+        }
+      } catch {
+        await MainActor.run {
+          if Task.isCancelled {
+            localAppState.textToImageLightningLoRAStatus = .notDownloaded
+          } else {
+            localAppState.textToImageLightningLoRAStatus = .error(error.localizedDescription)
+          }
+        }
+      }
+    }
+
+    textToImageLightningLoRATask = task
+    await task.value
+    textToImageLightningLoRATask = nil
+  }
+
+  private func cancelTextToImageLightningLoRADownload() {
+    textToImageLightningLoRATask?.cancel()
+    textToImageLightningLoRATask = nil
+    appState.textToImageLightningLoRAStatus = .notDownloaded
   }
 
   private var workflowStep: some View {

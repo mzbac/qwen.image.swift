@@ -48,10 +48,10 @@ public struct QwenFlowMatchConfig {
     self.patchSize = patchSize
   }
 
-  public static func load(fromSchedulerDirectory directory: URL) throws -> QwenFlowMatchConfig? {
+  public static func load(fromSchedulerDirectory directory: URL) throws -> QwenFlowMatchConfig {
     let configURL = directory.appending(path: "scheduler_config.json")
     guard FileManager.default.fileExists(atPath: configURL.path) else {
-      return nil
+      throw QwenConfigLoadingError.missingFile(configURL)
     }
     let data = try Data(contentsOf: configURL)
     let decoder = JSONDecoder()
@@ -146,6 +146,8 @@ public struct ProgressInfo {
     self.preview = preview
   }
 }
+
+public typealias QwenProgressHandler = (ProgressInfo) -> Void
 
 // MARK: - Layered Generation Parameters
 

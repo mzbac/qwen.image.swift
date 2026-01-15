@@ -8,12 +8,25 @@ Download the app: **[QwenImageApp.dmg](https://github.com/mzbac/qwen.image.swift
 
 ## CLI
 
-The CLI can run on a 32 GB machine by using 8-bit quantized model weights pulled from Hugging Face.
+The CLI loads model architecture from on-disk JSON configs (and will fail if they are missing):
+
+- `transformer/config.json`
+- `text_encoder/config.json`
+- `scheduler/scheduler_config.json`
+
+For lower memory usage, use runtime quantization (e.g. `--quant-bits 8`) or write a pre-packed snapshot via `--quantize-model`.
+
+If you still see high peak memory (especially on `Qwen/Qwen-Image-2512`), add:
+
+- `--gpu-cache-limit 16gb` to cap MLX's GPU cache, and
+- `--clear-cache-between-stages` to clear the GPU cache after prompt encoding (so released text-encoder weights don't stay cached).
+
+Use `--profile` to print timing + RSS checkpoints so you can see where memory spikes.
 
 ### Requirements
 
 - Apple Silicon Mac running macOS 14 Sonoma or newer.
-- Minimum 32 GB unified memory for the 8-bit quantized weights and runtime.
+- ~64 GB unified memory recommended for full bf16 weights; 32 GB can work with `--quant-bits 8` depending on model and settings.
 
 ### Download the CLI
 
@@ -30,7 +43,8 @@ chmod +x QwenImageCLI
 
 ```bash
 ./QwenImageCLI \
-  --model mzbac/Qwen-Image-Edit-2509-8bit \
+  --model Qwen/Qwen-Image-Edit-2511 \
+  --quant-bits 8 \
   --true-cfg-scale 1.0 \
   --guidance 1.0 \
   --steps 8 \
@@ -46,7 +60,8 @@ chmod +x QwenImageCLI
 
 ```bash
 ./QwenImageCLI \
-  --model mzbac/Qwen-Image-Edit-2509-8bit \
+  --model Qwen/Qwen-Image-Edit-2511 \
+  --quant-bits 8 \
   --true-cfg-scale 1.0 \
   --guidance 1.0 \
   --steps 8 \
@@ -61,7 +76,8 @@ The reference photo at `images/person4.png` plus the LoRA lightning adapter abov
 
 ```bash
 ./QwenImageCLI \
-  --model mzbac/Qwen-Image-Edit-2509-8bit \
+  --model Qwen/Qwen-Image-Edit-2511 \
+  --quant-bits 8 \
   --true-cfg-scale 1.0 \
   --guidance 1.0 \
   --steps 8 \
@@ -77,7 +93,8 @@ The first reference injects the living room background and the second reference 
 
 ```bash
 ./QwenImageCLI \
-  --model mzbac/Qwen-Image-Edit-2509-8bit \
+  --model Qwen/Qwen-Image-Edit-2511 \
+  --quant-bits 8 \
   --true-cfg-scale 1.0 \
   --guidance 1.0 \
   --steps 8 \
@@ -95,7 +112,7 @@ The CLI also supports layered image decomposition using the [Qwen-Image-Layered]
 
 ```bash
 ./QwenImageCLI \
-  --model mzbac/Qwen-Image-Layered-8bit \
+  --model Qwen/Qwen-Image-Layered \
   --layered \
   --layered-image images/layered_input.png \
   --layered-layers 2 \
@@ -120,6 +137,10 @@ Key flags:
 - `--negative-prompt` lets you suppress artifacts (e.g. "blurry, low contrast").
 - `--guidance`, `--true-cfg-scale`, and `--steps` provide full control over the diffusion schedule.
 - `--model`, `--revision`, and `--lora` point the CLI at Hugging Face repos or local safetensors.
+- `--dtype` overrides the model dtype (currently only `bfloat16` is supported) for weights, compute, and final decode.
+- `--quant-bits` enables runtime weight quantization to reduce memory (recommended for `Qwen/Qwen-Image-2512`).
+- `--gpu-cache-limit` and `--clear-cache-between-stages` help avoid MLX cache retention making memory look like multiple components are loaded at once.
+- `--profile` prints timing + RSS checkpoints for troubleshooting.
 - When a LoRA repo contains multiple weights, pass a specific file via `--lora owner/repo:filename.safetensors` or a Hugging Face file URL.
 - `--reference-image` can be supplied multiple times for image-to-image or pose-guided edits.
 

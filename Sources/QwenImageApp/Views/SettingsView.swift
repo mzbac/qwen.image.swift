@@ -1,4 +1,5 @@
 import SwiftUI
+import QwenImageRuntime
 
 struct SettingsView: View {
   @Environment(AppState.self) private var appState
@@ -66,6 +67,22 @@ struct AdvancedSettingsTab: View {
   var body: some View {
     Form {
       Section("Memory Optimization") {
+        Picker("GPU Cache Limit", selection: $settings.gpuCacheLimitGB) {
+          Text("2GB (Conservative)").tag(2)
+          Text("4GB").tag(4)
+          Text("8GB").tag(8)
+          Text("16GB").tag(16)
+        }
+        .onChange(of: settings.gpuCacheLimitGB) { _, newValue in
+          let clamped = max(1, newValue)
+          GPUCachePolicy.setCacheLimit(clamped * 1024 * 1024 * 1024)
+          GPUCachePolicy.clearCache()
+        }
+
+        Text("Lower values reduce peak memory but may slow generation. Changes apply immediately.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
         Toggle("Enable Quantization", isOn: $settings.quantizationEnabled)
 
         if settings.quantizationEnabled {

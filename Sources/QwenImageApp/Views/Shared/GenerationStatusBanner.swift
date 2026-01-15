@@ -3,7 +3,7 @@ import SwiftUI
 struct GenerationStatusBanner: View {
   let mode: GenerationMode
   let state: GenerationState
-  let onShow: () -> Void
+  let onShow: (() -> Void)?
 
   var body: some View {
     VStack(spacing: 6) {
@@ -26,10 +26,12 @@ struct GenerationStatusBanner: View {
 
         Spacer()
 
-        Button("Show") {
-          onShow()
+        if let onShow {
+          Button("Show") {
+            onShow()
+          }
+          .buttonStyle(.bordered)
         }
-        .buttonStyle(.bordered)
       }
 
       if case .generating(_, _, let progress) = state {

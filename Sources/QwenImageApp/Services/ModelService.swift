@@ -16,24 +16,13 @@ actor ModelService {
   private var layeredSession: LayeredPipelineSession?
   private var imageSession: ImagePipelineSession?
 
-  // MARK: - Legacy Pipeline Storage (for direct access if needed)
-
-  private var layeredPipeline: QwenLayeredPipeline?
-  private var imagePipeline: QwenImagePipeline?
-
   private var cachedPaths: [String: URL] = [:]
   private var loadedMode: LoadedPipeline?
-
-  private var currentModelId: String?
-  private var currentRevision: String = "main"
-
-  private var appliedLayeredLoRA: (url: URL, scale: Float)?
-
-  private var appliedImageLoRA: (url: URL, scale: Float)?
+  private var layeredSessionPath: URL?
+  private var imageSessionPath: URL?
+  private var imageSessionConfig: QwenImageConfig?
 
   private init() {
-    let preset = GPUCachePolicy.recommendedPreset()
-    GPUCachePolicy.applyPreset(preset)
   }
 
   // MARK: - Path Resolution
@@ -78,7 +67,7 @@ actor ModelService {
     revision: String = "main",
     progressHandler: @escaping @Sendable (HubSnapshotProgress) -> Void
   ) async throws -> URL {
-    let options = HubSnapshotOptions(
+    let options = try QwenModelRepository.snapshotOptions(
       repoId: repoId,
       revision: revision
     )
@@ -99,6 +88,24 @@ actor ModelService {
       repoId: repoId,
       revision: "main",
       patterns: ["Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"]
+    )
+
+    let snapshot = try HubSnapshot(options: options)
+    let path = try await snapshot.prepare(progressHandler: progressHandler)
+
+    cachedPaths[repoId] = path
+    return path
+  }
+
+  /// Download the Text-to-Image Lightning LoRA (Qwen-Image-2512) from HuggingFace.
+  func downloadTextToImageLightningLoRA(
+    progressHandler: @escaping @Sendable (HubSnapshotProgress) -> Void
+  ) async throws -> URL {
+    let repoId = "lightx2v/Qwen-Image-2512-Lightning"
+    let options = HubSnapshotOptions(
+      repoId: repoId,
+      revision: "main",
+      patterns: ["Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"]
     )
 
     let snapshot = try HubSnapshot(options: options)
@@ -136,6 +143,22 @@ actor ModelService {
     return FileManager.default.fileExists(atPath: path.path) ? path : nil
   }
 
+  /// Check if Text-to-Image Lightning LoRA is installed.
+  func isTextToImageLightningLoRAInstalled() -> Bool {
+    let path = hubPath()
+      .appending(path: "models/lightx2v/Qwen-Image-2512-Lightning")
+      .appending(path: "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors")
+    return FileManager.default.fileExists(atPath: path.path)
+  }
+
+  /// Get the Text-to-Image Lightning LoRA path if it exists.
+  func textToImageLightningLoRAPath() -> URL? {
+    let path = hubPath()
+      .appending(path: "models/lightx2v/Qwen-Image-2512-Lightning")
+      .appending(path: "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors")
+    return FileManager.default.fileExists(atPath: path.path) ? path : nil
+  }
+
   // MARK: - Session-Based Loading
 
   func loadLayeredSession(
@@ -149,14 +172,14 @@ actor ModelService {
     }
 
     if let session = layeredSession {
-      loadedMode = .layered
-      return session
+      if layeredSessionPath?.standardizedFileURL == path.standardizedFileURL {
+        loadedMode = .layered
+        return session
+      }
+      unloadLayeredPipeline()
     }
 
-    let pipeline = try await QwenLayeredPipeline.load(from: path, dtype: .bfloat16)
-    layeredPipeline = pipeline
-    currentModelId = modelId
-    currentRevision = revision
+    let pipeline = try await QwenLayeredPipeline.load(from: path)
 
     let session = LayeredPipelineSession(
       pipeline: pipeline,
@@ -165,6 +188,7 @@ actor ModelService {
       configuration: configuration
     )
     layeredSession = session
+    layeredSessionPath = path
     loadedMode = .layered
 
     return session
@@ -182,18 +206,20 @@ actor ModelService {
     }
 
     if let session = imageSession {
-      loadedMode = .imageEditing
-      return session
+      let samePath = imageSessionPath?.standardizedFileURL == path.standardizedFileURL
+      let existingConfig = imageSessionConfig
+      let canReuse = samePath && (existingConfig == .imageEditing || existingConfig == config)
+      if canReuse {
+        loadedMode = .imageEditing
+        return session
+      }
+      unloadImagePipeline()
     }
 
     let pipeline = QwenImagePipeline(config: config)
     pipeline.setBaseDirectory(path)
     try pipeline.prepareTokenizer(from: path, maxLength: nil)
     try pipeline.prepareVAE(from: path)
-
-    imagePipeline = pipeline
-    currentModelId = modelId
-    currentRevision = revision
 
     let session = ImagePipelineSession(
       pipeline: pipeline,
@@ -202,69 +228,30 @@ actor ModelService {
       configuration: configuration
     )
     imageSession = session
+    imageSessionPath = path
+    imageSessionConfig = config
     loadedMode = .imageEditing
 
     return session
-  }
-
-  // MARK: - Legacy Pipeline Loading (for backwards compatibility)
-
-  func loadLayeredPipeline(from path: URL) async throws -> QwenLayeredPipeline {
-    if loadedMode == .imageEditing {
-      unloadImagePipeline()
-    }
-
-    if let cached = layeredPipeline {
-      loadedMode = .layered
-      return cached
-    }
-
-    let pipeline = try await QwenLayeredPipeline.load(from: path, dtype: .bfloat16)
-    layeredPipeline = pipeline
-    loadedMode = .layered
-    return pipeline
-  }
-
-  func loadImagePipeline(from path: URL, config: QwenImageConfig) async throws -> QwenImagePipeline {
-    if loadedMode == .layered {
-      unloadLayeredPipeline()
-    }
-
-    if let cached = imagePipeline {
-      loadedMode = .imageEditing
-      return cached
-    }
-
-    let pipeline = QwenImagePipeline(config: config)
-    pipeline.setBaseDirectory(path)
-    try pipeline.prepareTokenizer(from: path, maxLength: nil)
-    try pipeline.prepareVAE(from: path)
-
-    imagePipeline = pipeline
-    loadedMode = .imageEditing
-    return pipeline
   }
 
   // MARK: - Unloading
 
   func unloadLayeredPipeline() {
     layeredSession = nil
-    layeredPipeline = nil
-    appliedLayeredLoRA = nil
+    layeredSessionPath = nil
     if loadedMode == .layered {
       loadedMode = nil
-      currentModelId = nil
     }
     GPUCachePolicy.clearCache()
   }
 
   func unloadImagePipeline() {
     imageSession = nil
-    imagePipeline = nil
-    appliedImageLoRA = nil
+    imageSessionPath = nil
+    imageSessionConfig = nil
     if loadedMode == .imageEditing {
       loadedMode = nil
-      currentModelId = nil
     }
     GPUCachePolicy.clearCache()
   }
@@ -272,36 +259,24 @@ actor ModelService {
   func unloadAll() {
     layeredSession = nil
     imageSession = nil
-    layeredPipeline = nil
-    imagePipeline = nil
-    appliedLayeredLoRA = nil
-    appliedImageLoRA = nil
+    layeredSessionPath = nil
+    imageSessionPath = nil
+    imageSessionConfig = nil
     loadedMode = nil
-    currentModelId = nil
     GPUCachePolicy.clearCache()
   }
 
   // MARK: - LoRA
 
-  @discardableResult
-  func applyLoRA(
-    to pipeline: QwenLayeredPipeline,
-    from url: URL,
-    scale: Float
-  ) throws -> Bool {
-    if let applied = appliedLayeredLoRA,
-       applied.url == url,
-       applied.scale == scale {
-      return false
-    }
-
-    try pipeline.applyLora(from: url, scale: scale)
-    appliedLayeredLoRA = (url: url, scale: scale)
-    return true
-  }
-
   func applyLoRAToLayeredSession(from url: URL, scale: Float) async throws {
     guard let session = layeredSession else {
+      throw ModelServiceError.noSessionLoaded
+    }
+    try await session.applyLora(from: url, scale: scale)
+  }
+
+  func applyLoRAToImageSession(from url: URL, scale: Float) async throws {
+    guard let session = imageSession else {
       throw ModelServiceError.noSessionLoaded
     }
     try await session.applyLora(from: url, scale: scale)
@@ -321,11 +296,11 @@ actor ModelService {
   // MARK: - Status
 
   var isLayeredLoaded: Bool {
-    layeredPipeline != nil
+    layeredSession != nil
   }
 
   var isImageLoaded: Bool {
-    imagePipeline != nil
+    imageSession != nil
   }
 
   var hasLayeredSession: Bool {
@@ -341,7 +316,6 @@ actor ModelService {
 
 enum ModelServiceError: Error {
   case noSessionLoaded
-  case pipelineNotLoaded
 }
 
 // MARK: - HubSnapshotProgress Extensions

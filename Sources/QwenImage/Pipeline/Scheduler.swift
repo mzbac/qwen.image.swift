@@ -274,6 +274,29 @@ public enum QwenSchedulerFactory {
     return (scheduler, runtime)
   }
 
+  public static func flowMatchSchedulerForLayered(
+    numInferenceSteps: Int,
+    width: Int,
+    height: Int,
+    flowMatchConfig: QwenFlowMatchConfig
+  ) -> QwenFlowMatchScheduler {
+    let patchSize = max(1, flowMatchConfig.patchSize)
+    let tokenWidth = max(1, width / patchSize)
+    let tokenHeight = max(1, height / patchSize)
+    let imageSequenceLength = Float(tokenWidth * tokenHeight)
+    let baseSequenceLength = max(1, flowMatchConfig.baseImageSequenceLength)
+    let mu = sqrt(imageSequenceLength / Float(baseSequenceLength))
+
+    return QwenFlowMatchScheduler(
+      numInferenceSteps: numInferenceSteps,
+      width: width,
+      height: height,
+      requiresSigmaShift: false,
+      flowMatchConfig: flowMatchConfig,
+      mu: mu
+    )
+  }
+
   private static func adjustedDimension(_ value: Int) -> Int {
     guard value > 0 else { return 16 }
     let multiple = max(1, value / 16)

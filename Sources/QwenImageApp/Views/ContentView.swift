@@ -19,9 +19,16 @@ struct ContentView: View {
     } detail: {
       VStack(spacing: 0) {
         if let active = appState.primaryActiveGeneration, active.state.isGenerating {
-          GenerationStatusBanner(mode: active.mode, state: active.state) {
-            state.selectedSidebarItem = .mode(active.mode)
-          }
+          let isAlreadyShowing: Bool = {
+            guard case .mode(let selectedMode) = state.selectedSidebarItem else { return false }
+            return selectedMode == active.mode
+          }()
+
+          GenerationStatusBanner(
+            mode: active.mode,
+            state: active.state,
+            onShow: isAlreadyShowing ? nil : { state.selectedSidebarItem = .mode(active.mode) }
+          )
         }
         detailView(for: state.selectedSidebarItem)
       }

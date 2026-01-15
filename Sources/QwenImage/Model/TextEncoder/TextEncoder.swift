@@ -48,6 +48,114 @@ public struct QwenTextEncoderConfiguration {
   }
 }
 
+extension QwenTextEncoderConfiguration {
+  public static func load(from textEncoderDirectory: URL) throws -> QwenTextEncoderConfiguration {
+    let configURL = textEncoderDirectory.appending(path: "config.json")
+    guard FileManager.default.fileExists(atPath: configURL.path) else {
+      throw QwenConfigLoadingError.missingFile(configURL)
+    }
+
+    let data = try Data(contentsOf: configURL)
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .useDefaultKeys
+
+    let raw: TextEncoderConfigJSON
+    do {
+      raw = try decoder.decode(TextEncoderConfigJSON.self, from: data)
+    } catch {
+      throw QwenConfigLoadingError.decodeFailed(configURL, underlying: error)
+    }
+
+    let defaults = QwenTextEncoderConfiguration()
+    let outputDType: DType
+    if let hint = raw.torchDType.flatMap(DType.parsingTorchDType) {
+      outputDType = hint
+    } else if raw.torchDType != nil {
+      throw QwenConfigLoadingError.invalidValue(
+        configURL,
+        message: "Unsupported torch_dtype: \(raw.torchDType ?? "")"
+      )
+    } else {
+      outputDType = defaults.outputDType
+    }
+
+    let configuration = QwenTextEncoderConfiguration(
+      vocabSize: raw.vocabSize ?? defaults.vocabSize,
+      hiddenSize: raw.hiddenSize ?? defaults.hiddenSize,
+      numHiddenLayers: raw.numHiddenLayers ?? defaults.numHiddenLayers,
+      numAttentionHeads: raw.numAttentionHeads ?? defaults.numAttentionHeads,
+      numKeyValueHeads: raw.numKeyValueHeads ?? defaults.numKeyValueHeads,
+      intermediateSize: raw.intermediateSize ?? defaults.intermediateSize,
+      ropeTheta: raw.ropeTheta ?? defaults.ropeTheta,
+      maxPositionEmbeddings: raw.maxPositionEmbeddings ?? defaults.maxPositionEmbeddings,
+      rmsNormEps: raw.rmsNormEps ?? defaults.rmsNormEps,
+      promptDropIndex: raw.promptDropIndex ?? defaults.promptDropIndex,
+      outputDType: outputDType
+    )
+
+    if configuration.vocabSize <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "vocabSize must be positive")
+    }
+    if configuration.hiddenSize <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "hiddenSize must be positive")
+    }
+    if configuration.numHiddenLayers <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "numHiddenLayers must be positive")
+    }
+    if configuration.numAttentionHeads <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "numAttentionHeads must be positive")
+    }
+    if configuration.numKeyValueHeads <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "numKeyValueHeads must be positive")
+    }
+    if configuration.intermediateSize <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "intermediateSize must be positive")
+    }
+    if configuration.ropeTheta <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "ropeTheta must be positive")
+    }
+    if configuration.maxPositionEmbeddings <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "maxPositionEmbeddings must be positive")
+    }
+    if configuration.rmsNormEps <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "rmsNormEps must be positive")
+    }
+    if configuration.promptDropIndex < 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "promptDropIndex must be >= 0")
+    }
+
+    return configuration
+  }
+
+  private struct TextEncoderConfigJSON: Decodable {
+    let vocabSize: Int?
+    let hiddenSize: Int?
+    let numHiddenLayers: Int?
+    let numAttentionHeads: Int?
+    let numKeyValueHeads: Int?
+    let intermediateSize: Int?
+    let ropeTheta: Float?
+    let maxPositionEmbeddings: Int?
+    let rmsNormEps: Float?
+    let promptDropIndex: Int?
+    let torchDType: String?
+
+    enum CodingKeys: String, CodingKey {
+      case vocabSize = "vocab_size"
+      case hiddenSize = "hidden_size"
+      case numHiddenLayers = "num_hidden_layers"
+      case numAttentionHeads = "num_attention_heads"
+      case numKeyValueHeads = "num_key_value_heads"
+      case intermediateSize = "intermediate_size"
+      case ropeTheta = "rope_theta"
+      case maxPositionEmbeddings = "max_position_embeddings"
+      case rmsNormEps = "rms_norm_eps"
+      case promptDropIndex = "prompt_drop_index"
+      case torchDType = "torch_dtype"
+    }
+  }
+}
+
 public final class QwenTextEncoder: Module {
 
   public let configuration: QwenTextEncoderConfiguration

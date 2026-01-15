@@ -30,7 +30,7 @@ struct WelcomeView: View {
       .padding(.horizontal, 40)
 
       // Lightning LoRA Suggestion (if not installed)
-      if kDefaultLightningLoRAPath == nil {
+      if kDefaultLightningLoRAPath == nil && appState.lightningLoRAStatus != .downloaded {
         LightningLoRASuggestion()
       }
 

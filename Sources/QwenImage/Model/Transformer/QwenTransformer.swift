@@ -30,6 +30,71 @@ public struct QwenTransformerConfiguration {
   }
 }
 
+extension QwenTransformerConfiguration {
+  public static func load(from transformerDirectory: URL) throws -> QwenTransformerConfiguration {
+    let configURL = transformerDirectory.appending(path: "config.json")
+    guard FileManager.default.fileExists(atPath: configURL.path) else {
+      throw QwenConfigLoadingError.missingFile(configURL)
+    }
+
+    let data = try Data(contentsOf: configURL)
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+    let raw: TransformerConfigJSON
+    do {
+      raw = try decoder.decode(TransformerConfigJSON.self, from: data)
+    } catch {
+      throw QwenConfigLoadingError.decodeFailed(configURL, underlying: error)
+    }
+
+    let defaults = QwenTransformerConfiguration()
+    let configuration = QwenTransformerConfiguration(
+      inChannels: raw.inChannels ?? defaults.inChannels,
+      outChannels: raw.outChannels ?? defaults.outChannels,
+      numberOfLayers: raw.numLayers ?? defaults.numberOfLayers,
+      attentionHeadDim: raw.attentionHeadDim ?? defaults.attentionHeadDim,
+      numberOfHeads: raw.numAttentionHeads ?? defaults.numberOfHeads,
+      jointAttentionDim: raw.jointAttentionDim ?? defaults.jointAttentionDim,
+      patchSize: raw.patchSize ?? defaults.patchSize
+    )
+
+    if configuration.inChannels <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "inChannels must be positive")
+    }
+    if configuration.outChannels <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "outChannels must be positive")
+    }
+    if configuration.numberOfLayers <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "numberOfLayers must be positive")
+    }
+    if configuration.attentionHeadDim <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "attentionHeadDim must be positive")
+    }
+    if configuration.numberOfHeads <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "numberOfHeads must be positive")
+    }
+    if configuration.jointAttentionDim <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "jointAttentionDim must be positive")
+    }
+    if configuration.patchSize <= 0 {
+      throw QwenConfigLoadingError.invalidValue(configURL, message: "patchSize must be positive")
+    }
+
+    return configuration
+  }
+
+  private struct TransformerConfigJSON: Decodable {
+    let inChannels: Int?
+    let outChannels: Int?
+    let numLayers: Int?
+    let attentionHeadDim: Int?
+    let numAttentionHeads: Int?
+    let jointAttentionDim: Int?
+    let patchSize: Int?
+  }
+}
+
 public final class QwenTransformer: Module {
 
   public let configuration: QwenTransformerConfiguration
